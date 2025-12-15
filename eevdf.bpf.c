@@ -61,6 +61,7 @@ struct task_ctx {
     u64 last_weight;   
     s64 saved_lag;     
     bool is_running;   
+    u64 last_boost_ns; 
 };
 
 struct run_accounting {
@@ -180,6 +181,10 @@ static __always_inline u64 eevdf_calculate_slice(struct task_struct *p)
     return slice_ns;
 }
 
+
+
+
+
 static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
 {
     s64 sum = sctx->avg_vruntime_sum + sctx->run_avg_vruntime_sum;
@@ -279,11 +284,6 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     v = tctx->vruntime;
     kick_cpu = scx_bpf_task_cpu(p);
 
-    if ((p->flags & (PF_KTHREAD | PF_WQ_WORKER)) && tctx->vruntime > sctx->V) {
-        tctx->vruntime = sctx->V;
-        v = tctx->vruntime;
-    }
-
     if (kick_cpu >= 0 && kick_cpu < MAX_CPUS) {
         u32 target_cpu_idx = (u32)kick_cpu;
         struct run_accounting *acct = bpf_map_lookup_elem(&cpu_run_account, &target_cpu_idx);
@@ -299,7 +299,7 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     if (is_wakeup) {
-        s64 lag = tctx->saved_lag;      
+        s64 lag = tctx->saved_lag;
         u64 V_now = sctx->V;
 
         if (lag > 0) {
@@ -310,8 +310,10 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
         }
 
         s64 dv = (s64)(v - V_now);
-        if (dv < -(s64)V_WINDOW_NS) v = V_now - V_WINDOW_NS;
-        else if (dv > (s64)V_WINDOW_NS) v = V_now + V_WINDOW_NS;
+        if (dv < -(s64)V_WINDOW_NS)
+            v = V_now - V_WINDOW_NS;
+        else if (dv > (s64)V_WINDOW_NS)
+            v = V_now + V_WINDOW_NS;
 
         tctx->vruntime = v;
         tctx->saved_lag = 0;
@@ -443,8 +445,6 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     bpf_spin_lock(&sctx->lock);
-
-    key_val = (s64)(ve - sctx->base_v) * (s64)w_val;
 
     sctx->avg_vruntime_sum -= key_val;
     sctx->avg_load -= w_val;
