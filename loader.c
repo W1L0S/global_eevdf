@@ -2,7 +2,16 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <stdint.h>      /* [新增] 引入标准整数类型 */
 #include <bpf/libbpf.h>
+
+/* [关键修复] 为骨架文件和 loader 定义内核风格的类型别名 */
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int32_t  s32;
+typedef int64_t  s64;
+
+/* 必须在定义了 u32 之后再包含骨架文件 */
 #include "eevdf.skel.h"
 
 static volatile bool exiting = false;
@@ -27,40 +36,31 @@ int main(int argc, char **argv)
     struct eevdf_bpf *skel;
     int err;
 
-    /* Set up signal handlers for graceful exit */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* Bump RLIMIT_MEMLOCK to allow BPF map creation */
     err = bump_memlock_rlimit();
     if (err) {
         fprintf(stderr, "Failed to increase rlimit: %d\n", err);
         return 1;
     }
 
-    /* Open BPF skeleton */
     skel = eevdf_bpf__open();
     if (!skel) {
         fprintf(stderr, "Failed to open BPF skeleton\n");
         return 1;
     }
 
-    /* Load & Verify BPF programs */
     err = eevdf_bpf__load(skel);
     if (err) {
         fprintf(stderr, "Failed to load and verify BPF skeleton\n");
         goto cleanup;
     }
 
-    /* * Configure Safety Timeout (Watchdog).
-     * If the BPF scheduler hangs or fails to dispatch tasks for 5 seconds,
-     * the kernel will automatically detach it to prevent system freeze.
-     */
     if (skel->struct_ops.eevdf_ops) {
         skel->struct_ops.eevdf_ops->timeout_ms = 5000;
     }
 
-    /* Attach scheduler to the kernel */
     err = eevdf_bpf__attach(skel);
     if (err) {
         fprintf(stderr, "Failed to attach BPF skeleton\n");
@@ -68,16 +68,14 @@ int main(int argc, char **argv)
     }
 
     printf("Successfully loaded Global EEVDF scheduler.\n");
-    printf("Watchdog protection enabled (5000ms).\n");
+    printf("  - Watchdog: 5000ms\n");
     printf("Press Ctrl+C to stop and detach.\n");
 
-    /* Main loop: keep process alive until signal */
     while (!exiting) {
         sleep(1);
     }
 
 cleanup:
-    /* Clean up and detach */
     eevdf_bpf__destroy(skel);
     return err < 0 ? -err : 0;
 }
