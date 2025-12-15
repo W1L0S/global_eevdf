@@ -1,0 +1,19 @@
+# build artifacts
+*.o
+*.a
+*.so
+*.lo
+*.la
+
+# BPF generated files
+*.skel.h
+*.bpf.o
+
+# editor / IDE
+*.swp
+*~
+.vscode/
+.idea/
+
+# misc
+*.log
