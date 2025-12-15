@@ -11,7 +11,13 @@
 #define MAX_RT_PRIO     100
 #define V_WINDOW_NS     (BASE_SLICE_NS * 4ULL) 
 #define MAX_CPUS        256              
-#define MAX_DISPATCH_LOOPS 32            
+
+/* * [关键调整] 
+ * 恢复循环以避免 NOHZ 错误，但限制为 8 次以防止 Hard Lockup。
+ * 8次足够跳过一小群绑定任务，又不会让 BPF 运行太久。
+ */
+#define MAX_DISPATCH_LOOPS 8            
+#define MAX_PEEK_LOOPS     8
 
 #include "../tools/sched_ext/include/scx/common.bpf.h"
 
@@ -181,10 +187,6 @@ static __always_inline u64 eevdf_calculate_slice(struct task_struct *p)
     return slice_ns;
 }
 
-
-
-
-
 static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
 {
     s64 sum = sctx->avg_vruntime_sum + sctx->run_avg_vruntime_sum;
@@ -317,6 +319,16 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
 
         tctx->vruntime = v;
         tctx->saved_lag = 0;
+    } else {
+        u64 V_now = sctx->V;
+        s64 dv = (s64)(v - V_now);
+
+        if (dv < -(s64)V_WINDOW_NS)
+            v = V_now - V_WINDOW_NS;
+        else if (dv > (s64)V_WINDOW_NS)
+            v = V_now + V_WINDOW_NS;
+
+        tctx->vruntime = v;
     }
     n->ve = v;
 
@@ -363,8 +375,18 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
 
     bpf_spin_unlock(&sctx->lock);
 
-    if (do_preempt && kick_cpu >= 0)
+    if (do_preempt && kick_cpu >= 0) {
         scx_bpf_kick_cpu(kick_cpu, SCX_KICK_PREEMPT);
+    } else {
+        const struct cpumask *idle = scx_bpf_get_idle_cpumask();
+        if (idle) {
+            u32 target = bpf_cpumask_first(idle);
+            if (target < MAX_CPUS && bpf_cpumask_test_cpu(target, idle)) {
+                scx_bpf_kick_cpu((s32)target, SCX_KICK_IDLE);
+            }
+            scx_bpf_put_idle_cpumask(idle);
+        }
+    }
         
     return 0;
 }
@@ -379,17 +401,25 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     struct run_accounting *acct;
     struct task_ctx *tctx;
     u32 key = 0;
-    
-    if (cpu < 0 || cpu >= MAX_CPUS) return 0;
     u32 cpu_idx = (u32)cpu;
+
+    if (cpu < 0 || cpu >= MAX_CPUS) return 0;
 
     sctx = bpf_map_lookup_elem(&eevdf_ctx, &key);
     if (!sctx) return 0;
 
-    acct = bpf_map_lookup_elem(&cpu_run_account, &cpu_idx);
-    if (!acct) return 0;
-
     bpf_spin_lock(&sctx->lock);
+
+    u64 total_load = sctx->avg_load + sctx->run_avg_load;
+    
+    // Future -> Ready Logic
+    node = bpf_rbtree_first(&sctx->future);
+    if (node && total_load == 0) {
+        n = container_of(node, struct eevdf_node, node);
+        if (n->ve > sctx->V) {
+            sctx->V = n->ve; 
+        }
+    }
 
     int loops = 0;
     while (loops < MAX_DISPATCH_LOOPS) {
@@ -397,78 +427,125 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         if (!node) break;
         n = container_of(node, struct eevdf_node, node);
         if (n->ve > sctx->V) break; 
+        
         node = bpf_rbtree_remove(&sctx->future, node);
         if (!node) break; 
         bpf_rbtree_add(&sctx->ready, node, less_ready);
         loops++;
     }
-
-    node = bpf_rbtree_first(&sctx->ready);
-    if (!node) {
-        bpf_spin_unlock(&sctx->lock);
-        return 0;
-    }
-    node = bpf_rbtree_remove(&sctx->ready, node);
-    if (!node) {
-        bpf_spin_unlock(&sctx->lock);
-        return 0;
-    }
-    n = container_of(node, struct eevdf_node, node);
-
-    u64 w_val = eevdf_scaled_weight(n->weight);
-    s64 key_val = (s64)(n->ve - sctx->base_v) * (s64)w_val;
-
-    s32 pid = n->pid;
-    u64 vd = n->vd;
-    u64 ve = n->ve;
-    u64 wmult = n->wmult;
-
+    
     bpf_spin_unlock(&sctx->lock);
 
-    p = bpf_task_from_pid(pid);
-    if (!p) {
+    /*
+     * [BALANCE FIX] 恢复循环，但限制次数。
+     * MAX_PEEK_LOOPS = 8。这足以处理大多数绑定任务堆积的情况，
+     * 同时避免长时间运行 BPF 导致锁死或 NOHZ 错误。
+     */
+    int peek_loops = 0;
+    while (peek_loops < MAX_PEEK_LOOPS) {
+        peek_loops++;
+
         bpf_spin_lock(&sctx->lock);
-        sctx->avg_vruntime_sum -= key_val;
-        sctx->avg_load -= w_val;
-        sctx->V = eevdf_calc_V(sctx);
+        node = bpf_rbtree_first(&sctx->ready);
+        if (!node) {
+            bpf_spin_unlock(&sctx->lock);
+            return 0; // 无任务
+        }
+        node = bpf_rbtree_remove(&sctx->ready, node);
+        if (!node) {
+            bpf_spin_unlock(&sctx->lock);
+            return 0;
+        }
+        n = container_of(node, struct eevdf_node, node);
+
+        u64 w_val = eevdf_scaled_weight(n->weight);
+        s64 key_val = (s64)(n->ve - sctx->base_v) * (s64)w_val;
+        s32 pid = n->pid;
+        u64 vd = n->vd;
+        u64 wmult = n->wmult;
+        u64 slice = n->slice_ns;
         bpf_spin_unlock(&sctx->lock);
 
+        p = bpf_task_from_pid(pid);
+        if (!p) {
+            bpf_spin_lock(&sctx->lock);
+            sctx->avg_vruntime_sum -= key_val;
+            sctx->avg_load -= w_val;
+            sctx->V = eevdf_calc_V(sctx);
+            bpf_spin_unlock(&sctx->lock);
+            bpf_obj_drop(n);
+            continue; 
+        }
+
+        /* --- Affinity Check --- */
+        bool run_local = true;
+        s32 target_cpu = scx_bpf_task_cpu(p);
+
+        if (target_cpu != cpu) {
+            if (p->nr_cpus_allowed == 1) {
+                run_local = false;
+            } else if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+                run_local = false;
+            }
+        }
+
+        if (!run_local) {
+            // Remote dispatch
+            u64 dsq_id = SCX_DSQ_LOCAL_ON | target_cpu;
+
+            bpf_spin_lock(&sctx->lock);
+            sctx->avg_vruntime_sum -= key_val;
+            sctx->avg_load -= w_val;
+            sctx->V = eevdf_calc_V(sctx);
+            bpf_spin_unlock(&sctx->lock);
+
+            scx_bpf_dispatch(p, dsq_id, slice, 0);
+            scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
+            
+            bpf_task_release(p);
+            bpf_obj_drop(n);
+            
+            // [关键] 继续尝试，直到上限 8 次
+            continue;
+        }
+
+        /* --- Local Dispatch --- */
+        acct = bpf_map_lookup_elem(&cpu_run_account, &cpu_idx);
+        tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+
+        if (acct && tctx) {
+            tctx->last_run_ns = bpf_ktime_get_ns();
+            tctx->is_running = true;
+            tctx->saved_vd = vd;
+
+            bpf_spin_lock(&sctx->lock);
+            sctx->avg_vruntime_sum -= key_val;
+            sctx->avg_load -= w_val;
+            sctx->run_avg_vruntime_sum += key_val;
+            sctx->run_avg_load += w_val;
+            sctx->V = eevdf_calc_V(sctx);
+            bpf_spin_unlock(&sctx->lock);
+
+            acct->weight_val = w_val;
+            acct->key_val = key_val;
+            acct->curr_vd = vd;
+            acct->wmult = wmult;
+            acct->valid = 1;
+        } else {
+            bpf_spin_lock(&sctx->lock);
+            sctx->avg_vruntime_sum -= key_val;
+            sctx->avg_load -= w_val;
+            sctx->V = eevdf_calc_V(sctx);
+            bpf_spin_unlock(&sctx->lock);
+        }
+
+        scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, 0);
+        bpf_task_release(p);
         bpf_obj_drop(n);
-        return 0;
+        
+        return 0; // Found task, done.
     }
 
-    tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-    if (tctx) {
-        tctx->last_run_ns = bpf_ktime_get_ns();
-        tctx->is_running = true;
-        tctx->saved_vd = vd;
-    }
-
-    bpf_spin_lock(&sctx->lock);
-
-    sctx->avg_vruntime_sum -= key_val;
-    sctx->avg_load -= w_val;
-    sctx->run_avg_vruntime_sum += key_val;
-    sctx->run_avg_load += w_val;
-
-    acct->weight_val = w_val;
-    acct->key_val = key_val;
-    acct->curr_vd = vd;
-    acct->wmult = wmult;
-    acct->valid = 1;
-
-    sctx->V = eevdf_calc_V(sctx);
-    bpf_spin_unlock(&sctx->lock);
-
-    u64 dsq_id = SCX_DSQ_LOCAL;
-    s32 target = scx_bpf_task_cpu(p);
-    if (target >= 0 && target < MAX_CPUS)
-        dsq_id = SCX_DSQ_LOCAL_ON | (u32)target;
-
-    scx_bpf_dispatch(p, dsq_id, n->slice_ns, 0);
-    bpf_task_release(p);
-
-    bpf_obj_drop(n);
     return 0;
 }
 
@@ -549,7 +626,7 @@ int BPF_PROG(eevdf_enable)
     sctx->run_avg_load = 0;
     bpf_spin_unlock(&sctx->lock);
     
-    bpf_printk("Global EEVDF Scheduler Enabled (Robust Mode)");
+    bpf_printk("Global EEVDF Scheduler Enabled (Balanced Loop Mode)");
     return 0;
 }
 
