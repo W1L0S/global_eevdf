@@ -9,7 +9,7 @@
 #define MIN_SLICE_NS    1000000ULL
 #define EEVDF_PERIOD_NS 12000000ULL
 #define MAX_RT_PRIO     100
-#define V_WINDOW_NS     (BASE_SLICE_NS * 4ULL)
+#define LAG_CLAMP_NS    (BASE_SLICE_NS * 3ULL)  /* Lag clamped to ±3 * base_slice */
 #define MAX_CPUS        256
 
 /* * [关键调整]
@@ -62,6 +62,7 @@ struct eevdf_node {
 
 struct task_ctx {
     u64 vruntime;
+    s64 lag;          /* Saved lag (vruntime - V) for lag compensation */
     u64 last_run_ns;
     u64 saved_vd;
     u64 last_weight;
@@ -115,6 +116,36 @@ struct {
 /* --- Internal Helpers --- */
 
 static __always_inline void eevdf_avg_add(struct eevdf_ctx_t *sctx, struct eevdf_node *n);
+
+/* Clamp lag to ±3 * base_slice */
+static __always_inline s64 eevdf_clamp_lag(s64 lag)
+{
+    s64 limit = (s64)LAG_CLAMP_NS;
+    if (lag > limit) return limit;
+    if (lag < -limit) return -limit;
+    return lag;
+}
+
+/*
+ * Calculate lag / total_weight using multiplication by inverse
+ * This is more kernel-like than direct division
+ * Returns the delta to apply to V
+ */
+static __always_inline u64 eevdf_lag_div_weight(s64 lag, u64 total_weight)
+{
+    if (total_weight == 0) return 0;
+
+    // Calculate inverse weight: inv_weight = (1ULL << 32) / total_weight
+    u64 inv_weight = ((u64)1 << 32) / total_weight;
+
+    // Get absolute value of lag
+    u64 abs_lag = lag < 0 ? (u64)(-lag) : (u64)lag;
+
+    // delta = (abs_lag * inv_weight) >> 32
+    u64 delta = (abs_lag * inv_weight) >> 32;
+
+    return delta;
+}
 
 static bool less_ready(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 {
@@ -201,7 +232,7 @@ static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
         V_now = sctx->base_v - ((u64)(-sum + load - 1) / load);
 
     s64 dv = (s64)(V_now - sctx->base_v);
-    if (dv > (s64)(V_WINDOW_NS * 4ULL) || dv < -(s64)(V_WINDOW_NS * 4ULL)) {
+    if (dv > (s64)(LAG_CLAMP_NS * 4ULL) || dv < -(s64)(LAG_CLAMP_NS * 4ULL)) {
         u64 base_old = sctx->base_v;
         u64 base_new = V_now;
         s64 delta = (s64)(base_new - base_old);
@@ -241,6 +272,7 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     struct eevdf_node *fn;
     u32 key = 0;
     u64 v, weight, wmult, slice_ns, vslice;
+    s64 lag;
     int idx;
 
     // 分配新的EEVDF节点
@@ -269,34 +301,89 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     n->slice_ns = slice_ns;
     vslice = (slice_ns * NICE_0_LOAD * wmult) >> 32;
 
-    v = tctx->vruntime;
-
     bpf_spin_lock(&sctx->lock);
-
-    // 初始化新任务的vruntime
-    if (v == 0 && sctx->V > 0) {
-        v = sctx->V;
-        tctx->vruntime = v;
-    }
-
-    // 限制v在V值窗口内，防止极端值导致饥饿
-    u64 V_now = sctx->V;
-    s64 dv = (s64)(v - V_now);
-    if (dv < -(s64)V_WINDOW_NS)
-        v = V_now - V_WINDOW_NS;
-    else if (dv > (s64)V_WINDOW_NS)
-        v = V_now + V_WINDOW_NS;
-
-    tctx->vruntime = v;
-    n->ve = v;  // 虚拟就绪时间 = vruntime
 
     // 首个任务时初始化虚拟时间系统
     if (!sctx->avg_load && !sctx->run_avg_load) {
-        sctx->base_v = n->ve;
+        // 初始化时 lag = 0, vruntime = V
+        tctx->vruntime = 0;
+        tctx->lag = 0;
+        sctx->base_v = 0;
         sctx->avg_vruntime_sum = 0;
         sctx->run_avg_vruntime_sum = 0;
-        sctx->V = n->ve;
+        sctx->V = 0;
+        v = 0;
+    } else {
+        // 读取保存的 lag (dequeue 时保存的 lag)
+        lag = tctx->lag;
+        u64 old_weight = tctx->last_weight;
+
+        // Clamp lag 到 ±3 * base_slice（在使用前 clamp）
+        lag = eevdf_clamp_lag(lag);
+
+        // EEVDF 公式 (5) 或 (6): 当 client 加入竞争时
+        // 如果权重变更，需要按照公式 (6) 处理
+        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
+
+        // 检查权重是否变更
+        bool weight_changed = (old_weight != 0 && old_weight != weight);
+
+        if (weight_changed && total_weight > 0) {
+            // 公式 (6): 权重变更时
+            // V = V + lag/(Σw_i - w_old) - lag/(Σw_i - w_old + w_new)
+            // 简化为: V = V + lag/total_weight - lag/(total_weight + w_new)
+            // 注意：此时 total_weight 不包含该任务
+
+            // 第一项：+lag / total_weight（以旧权重离开的影响）
+            u64 v_delta1 = eevdf_lag_div_weight(lag, total_weight);
+            if (lag >= 0) {
+                sctx->V = sctx->V + v_delta1;
+            } else {
+                sctx->V = sctx->V >= v_delta1 ? sctx->V - v_delta1 : 0;
+            }
+
+            // 第二项：-lag / (total_weight + new_weight)（以新权重加入的影响）
+            u64 v_delta2 = eevdf_lag_div_weight(lag, total_weight + eevdf_scaled_weight(weight));
+            if (lag >= 0) {
+                sctx->V = sctx->V >= v_delta2 ? sctx->V - v_delta2 : 0;
+            } else {
+                sctx->V = sctx->V + v_delta2;
+            }
+        } else if (total_weight > 0) {
+            // 公式 (5): 普通加入（权重未变更）
+            // V = V - lag / (total_weight + new_weight)
+            u64 scaled_w = eevdf_scaled_weight(weight);
+            u64 v_delta = eevdf_lag_div_weight(lag, total_weight + scaled_w);
+
+            if (lag >= 0) {
+                // lag > 0: V = V - lag/w（任务超前，降低 V）
+                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
+            } else {
+                // lag < 0: V = V - (-lag)/w = V + lag/w（任务落后，提升 V）
+                sctx->V = sctx->V + v_delta;
+            }
+        }
+
+        // 恢复 vruntime: vruntime = V + lag
+        v = sctx->V;
+        if (lag >= 0) {
+            v = v + (u64)lag;
+        } else {
+            u64 abs_lag = (u64)(-lag);
+            v = v >= abs_lag ? v - abs_lag : 0;
+        }
+
+        // 新任务初始化为当前 V
+        if (tctx->vruntime == 0) {
+            v = sctx->V;
+            lag = 0;
+        }
+
+        tctx->vruntime = v;
+        tctx->lag = lag;  // 更新保存的 lag（已 clamped）
     }
+
+    n->ve = v;  // 虚拟就绪时间 = vruntime
 
     // 计算虚拟截止时间：vd = ve + vslice（EEVDF核心公式）
     n->vd = n->ve + vslice;
@@ -515,7 +602,7 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
     if (!valid || !w || !wmult) return 0;
 
     tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-    
+
     if (tctx && tctx->last_run_ns) {
         u64 now = bpf_ktime_get_ns();
         u64 delta_ns = now - tctx->last_run_ns;
@@ -531,6 +618,31 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
 
     sctx->run_avg_vruntime_sum -= k;
     sctx->run_avg_load -= w;
+
+    // EEVDF 公式 (4): 当 client 离开竞争时，计算并保存 lag
+    if (tctx) {
+        // 计算 lag = vruntime - V
+        s64 lag = (s64)(tctx->vruntime - sctx->V);
+
+        // 保存 lag 到 task_ctx（在 enqueue 时使用）
+        tctx->lag = lag;
+
+        // 更新 V: V = V + lag / Σw_i
+        // 注意：这里的 total_weight 是离开后的权重（已经减去了当前任务）
+        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
+        if (total_weight > 0) {
+            // 使用乘倒数计算 lag / total_weight
+            u64 v_delta = eevdf_lag_div_weight(lag, total_weight);
+
+            // V = V + lag / total_weight
+            if (lag >= 0) {
+                sctx->V = sctx->V + v_delta;
+            } else {
+                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
+            }
+        }
+    }
+
     sctx->V = eevdf_calc_V(sctx);
 
     bpf_spin_unlock(&sctx->lock);
@@ -556,6 +668,9 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
         n->weight = new_weight;
         n->wmult = new_wmult;
 
+        // 保存旧权重用于权重变更检测
+        u64 old_weight = tctx->last_weight;
+
         // 更新task_ctx中的权重
         tctx->last_weight = new_weight;
 
@@ -570,6 +685,24 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
         n->vd = n->ve + vslice;
 
         bpf_spin_lock(&sctx->lock);
+
+        // 处理重新加入时的 V 更新（公式 5 或 6）
+        // 之前已经执行了 V += lag / total_weight（离开）
+        // 现在需要执行 V -= lag / (total_weight + new_weight)（加入）
+        s64 lag = tctx->lag;
+        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
+
+        if (total_weight > 0) {
+            u64 scaled_new_w = eevdf_scaled_weight(new_weight);
+            u64 v_delta = eevdf_lag_div_weight(lag, total_weight + scaled_new_w);
+
+            // V = V - lag / (total_weight + new_weight)
+            if (lag >= 0) {
+                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
+            } else {
+                sctx->V = sctx->V + v_delta;
+            }
+        }
 
         // 将任务加入统计
         eevdf_avg_add(sctx, n);
@@ -608,7 +741,7 @@ int BPF_PROG(eevdf_enable)
     sctx->run_avg_load = 0;
     bpf_spin_unlock(&sctx->lock);
     
-    bpf_printk("Global EEVDF Scheduler Enabled (Balanced Loop Mode)");
+    bpf_printk("Global EEVDF Scheduler Enabled");
     return 0;
 }
 
