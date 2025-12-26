@@ -1,19 +1,34 @@
-# build artifacts
+# 编译产物
+build/
 *.o
 *.a
 *.so
 *.lo
 *.la
-
-# BPF generated files
 *.skel.h
 *.bpf.o
 
-# editor / IDE
-*.swp
-*~
+# 可执行文件
+loader
+
+# Trace 文件
+*.txt
+*.dat
+*.perfetto
+*.perfetto-trace
+*.log
+scheduler_trace.*
+
+# IDE 和编辑器
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
-# misc
-*.log
+# Claude 临时文件
+.claude/
+
+# Zone Identifier（Windows WSL）
+*:Zone.Identifier

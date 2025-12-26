@@ -1,0 +1,143 @@
+#!/bin/bash
+# EEVDF 调度器主测试脚本
+# 支持CPU测试和混合负载测试
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_ROOT"
+
+TRACE_DIR="/sys/kernel/tracing"
+TEXT_TRACE="$PROJECT_ROOT/scheduler_trace.txt"
+
+# 默认参数
+TEST_MODE="cpu"  # cpu | mixed
+DURATION=10
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --cpu-only)
+            TEST_MODE="cpu"
+            shift
+            ;;
+        --mixed)
+            TEST_MODE="mixed"
+            shift
+            ;;
+        --duration)
+            DURATION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "用法: $0 [选项]"
+            echo ""
+            echo "选项:"
+            echo "  --cpu-only       仅测试CPU密集型负载（默认）"
+            echo "  --mixed          测试混合负载（CPU + I/O）"
+            echo "  --duration N     测试时长（秒，默认10）"
+            echo "  -h, --help       显示此帮助信息"
+            exit 0
+            ;;
+        *)
+            echo "未知选项: $1"
+            echo "使用 -h 查看帮助"
+            exit 1
+            ;;
+    esac
+done
+
+echo "========================================"
+echo "EEVDF 调度器测试"
+echo "========================================"
+echo "测试模式: $TEST_MODE"
+echo "测试时长: ${DURATION}秒"
+echo ""
+
+# 检查权限
+if [ "$EUID" -ne 0 ]; then
+    echo "错误：需要root权限"
+    echo "请使用: sudo $0"
+    exit 1
+fi
+
+# 清理旧文件
+rm -f "$TEXT_TRACE"
+
+echo "[1/5] 配置 ftrace..."
+echo 0 > $TRACE_DIR/tracing_on
+echo > $TRACE_DIR/trace
+echo 8192 > $TRACE_DIR/buffer_size_kb
+echo 1 > $TRACE_DIR/events/sched/sched_switch/enable
+echo 1 > $TRACE_DIR/events/sched/sched_wakeup/enable
+echo nop > $TRACE_DIR/current_tracer
+
+echo ""
+echo "[2/5] 启动 ftrace..."
+echo 1 > $TRACE_DIR/tracing_on
+
+echo ""
+echo "[3/5] 启动 EEVDF 调度器..."
+./build/loader &
+LOADER_PID=$!
+echo "  - Loader PID: $LOADER_PID"
+sleep 3
+
+if [ -f /sys/kernel/sched_ext/state ]; then
+    STATE=$(cat /sys/kernel/sched_ext/state)
+    echo "  - 调度器状态: $STATE"
+    if [ "$STATE" != "enabled" ]; then
+        echo "  ⚠ 警告：调度器未启用！"
+        kill $LOADER_PID 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+echo ""
+echo "[4/5] 运行测试..."
+echo "  ⏱ 开始时间: $(date '+%H:%M:%S')"
+
+if [ "$TEST_MODE" = "cpu" ]; then
+    echo "  模式: CPU密集型"
+    timeout $((DURATION + 5))s stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief 2>&1 || {
+        echo "  ⚠ stress-ng 超时或失败"
+    }
+elif [ "$TEST_MODE" = "mixed" ]; then
+    echo "  模式: 混合负载（CPU + I/O）"
+    timeout $((DURATION + 5))s stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief 2>&1 || {
+        echo "  ⚠ stress-ng 超时或失败"
+    }
+fi
+
+echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
+
+echo ""
+echo "[5/5] 停止收集..."
+echo 0 > $TRACE_DIR/tracing_on
+
+# 停止调度器
+echo "  - 停止调度器..."
+kill -SIGTERM $LOADER_PID 2>/dev/null || true
+wait $LOADER_PID 2>/dev/null || true
+sleep 1
+
+# 导出trace
+cat $TRACE_DIR/trace > "$TEXT_TRACE"
+
+# 禁用事件
+echo 0 > $TRACE_DIR/events/sched/sched_switch/enable
+echo 0 > $TRACE_DIR/events/sched/sched_wakeup/enable
+
+TRACE_LINES=$(wc -l < "$TEXT_TRACE")
+
+echo ""
+echo "========================================"
+echo "测试完成！"
+echo "========================================"
+echo "Trace 文件: $TEXT_TRACE"
+echo "事件数量: $TRACE_LINES 行"
+echo ""
+echo "快速分析:"
+echo "  ./scripts/analyze.sh $TEXT_TRACE"
+echo "========================================"
