@@ -12,12 +12,14 @@
 #define LAG_CLAMP_NS    (BASE_SLICE_NS * 3ULL)  /* Lag clamped to ±3 * base_slice */
 #define MAX_CPUS        256
 
-/* * [关键调整]
- * 恢复循环以避免 NOHZ 错误，但限制为 8 次以防止 Hard Lockup。
- * 8次足够跳过一小群绑定任务，又不会让 BPF 运行太久。
+/*
+ * [关键调整]
+ * 限制循环次数以避免 NOHZ tick-stop 错误。
+ * 增加到 4 次以确保在高负载下 future -> ready 转移能及时完成。
+ * 同时避免 BPF 运行过长导致 softirq 积压。
  */
-#define MAX_DISPATCH_LOOPS 8
-#define MAX_PEEK_LOOPS     8
+#define MAX_DISPATCH_LOOPS 4
+#define MAX_PEEK_LOOPS     4
 
 #include "../../tools/sched_ext/include/scx/common.bpf.h"
 
@@ -437,30 +439,44 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
     bpf_spin_lock(&sctx->lock);
 
-    u64 total_load = sctx->avg_load + sctx->run_avg_load;
-    
-    // Future -> Ready Logic
-    node = bpf_rbtree_first(&sctx->future);
-    if (node && total_load == 0) {
-        n = container_of(node, struct eevdf_node, node);
-        if (n->ve > sctx->V) {
-            sctx->V = n->ve; 
+    /*
+     * [关键修复] 饥饿问题修复
+     *
+     * 问题：当 ready 队列为空但 future 队列有任务时，
+     * 如果有其他 CPU 正在运行任务 (run_avg_load > 0)，
+     * V 不会更新，导致 future 队列中的任务永远无法变为"合格"。
+     *
+     * 解决方案：当 ready 队列为空时，无条件检查 future 队列，
+     * 并将 V 更新到最小 ve，确保任务能够被调度。
+     */
+    node = bpf_rbtree_first(&sctx->ready);
+    if (!node) {
+        // ready 队列为空，检查 future 队列
+        node = bpf_rbtree_first(&sctx->future);
+        if (node) {
+            n = container_of(node, struct eevdf_node, node);
+            // 强制更新 V 到 future 队列首个任务的 ve
+            // 这确保 future 中的任务可以立即变为"合格"
+            if (n->ve > sctx->V) {
+                sctx->V = n->ve;
+            }
         }
     }
 
+    // Future -> Ready 转移
     int loops = 0;
     while (loops < MAX_DISPATCH_LOOPS) {
         node = bpf_rbtree_first(&sctx->future);
         if (!node) break;
         n = container_of(node, struct eevdf_node, node);
-        if (n->ve > sctx->V) break; 
-        
+        if (n->ve > sctx->V) break;
+
         node = bpf_rbtree_remove(&sctx->future, node);
-        if (!node) break; 
+        if (!node) break;
         bpf_rbtree_add(&sctx->ready, node, less_ready);
         loops++;
     }
-    
+
     bpf_spin_unlock(&sctx->lock);
 
     /*
@@ -527,13 +543,14 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_spin_unlock(&sctx->lock);
 
             scx_bpf_dispatch(p, dsq_id, slice, 0);
-            scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
-            
+            // 使用 IDLE kick 而不是 PREEMPT，减少 softirq 压力
+            scx_bpf_kick_cpu(target_cpu, 0);
+
             bpf_task_release(p);
             bpf_obj_drop(n);
-            
-            // [关键] 继续尝试，直到上限 8 次
-            continue;
+
+            // [优化] remote dispatch 后返回，避免单次调用处理过多任务
+            return 0;
         }
 
         /* --- Local Dispatch --- */
