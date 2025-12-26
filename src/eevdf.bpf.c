@@ -64,7 +64,7 @@ struct eevdf_node {
 
 struct task_ctx {
     u64 vruntime;
-    s64 lag;          /* Saved lag (vruntime - V) for lag compensation */
+    s64 vlag;         /* vlag = V - vruntime (正值=落后，负值=超前) */
     u64 last_run_ns;
     u64 saved_vd;
     u64 last_weight;
@@ -307,82 +307,70 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
 
     // 首个任务时初始化虚拟时间系统
     if (!sctx->avg_load && !sctx->run_avg_load) {
-        // 初始化时 lag = 0, vruntime = V
+        // 初始化时 vlag = 0, vruntime = V
         tctx->vruntime = 0;
-        tctx->lag = 0;
+        tctx->vlag = 0;
         sctx->base_v = 0;
         sctx->avg_vruntime_sum = 0;
         sctx->run_avg_vruntime_sum = 0;
         sctx->V = 0;
         v = 0;
     } else {
-        // 读取保存的 lag (dequeue 时保存的 lag)
-        lag = tctx->lag;
-        u64 old_weight = tctx->last_weight;
+        // 检查是否是新任务（vruntime未初始化）
+        bool is_new_task = (tctx->vruntime == 0);
 
-        // Clamp lag 到 ±3 * base_slice（在使用前 clamp）
-        lag = eevdf_clamp_lag(lag);
-
-        // EEVDF 公式 (5) 或 (6): 当 client 加入竞争时
-        // 如果权重变更，需要按照公式 (6) 处理
-        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
-
-        // 检查权重是否变更
-        bool weight_changed = (old_weight != 0 && old_weight != weight);
-
-        if (weight_changed && total_weight > 0) {
-            // 公式 (6): 权重变更时
-            // V = V + lag/(Σw_i - w_old) - lag/(Σw_i - w_old + w_new)
-            // 简化为: V = V + lag/total_weight - lag/(total_weight + w_new)
-            // 注意：此时 total_weight 不包含该任务
-
-            // 第一项：+lag / total_weight（以旧权重离开的影响）
-            u64 v_delta1 = eevdf_lag_div_weight(lag, total_weight);
-            if (lag >= 0) {
-                sctx->V = sctx->V + v_delta1;
-            } else {
-                sctx->V = sctx->V >= v_delta1 ? sctx->V - v_delta1 : 0;
-            }
-
-            // 第二项：-lag / (total_weight + new_weight)（以新权重加入的影响）
-            u64 v_delta2 = eevdf_lag_div_weight(lag, total_weight + eevdf_scaled_weight(weight));
-            if (lag >= 0) {
-                sctx->V = sctx->V >= v_delta2 ? sctx->V - v_delta2 : 0;
-            } else {
-                sctx->V = sctx->V + v_delta2;
-            }
-        } else if (total_weight > 0) {
-            // 公式 (5): 普通加入（权重未变更）
-            // V = V - lag / (total_weight + new_weight)
-            u64 scaled_w = eevdf_scaled_weight(weight);
-            u64 v_delta = eevdf_lag_div_weight(lag, total_weight + scaled_w);
-
-            if (lag >= 0) {
-                // lag > 0: V = V - lag/w（任务超前，降低 V）
-                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
-            } else {
-                // lag < 0: V = V - (-lag)/w = V + lag/w（任务落后，提升 V）
-                sctx->V = sctx->V + v_delta;
-            }
-        }
-
-        // 恢复 vruntime: vruntime = V + lag
-        v = sctx->V;
-        if (lag >= 0) {
-            v = v + (u64)lag;
-        } else {
-            u64 abs_lag = (u64)(-lag);
-            v = v >= abs_lag ? v - abs_lag : 0;
-        }
-
-        // 新任务初始化为当前 V
-        if (tctx->vruntime == 0) {
+        if (is_new_task) {
+            // 新任务: 直接设置为当前 V，vlag = 0
             v = sctx->V;
-            lag = 0;
+            tctx->vlag = 0;
+        } else {
+            /*
+             * [关键修复] 使用Linux内核风格的vlag恢复逻辑
+             *
+             * Linux内核定义: vlag = V - vruntime
+             *   - vlag > 0: 任务落后于系统平均（应该给予补偿）
+             *   - vlag < 0: 任务超前于系统平均（应该惩罚）
+             *
+             * 恢复公式（来自Linux内核place_entity）:
+             *   vruntime = V - vlag
+             *
+             * 这样:
+             *   - 如果任务落后(vlag > 0): vruntime = V - vlag < V，进入ready队列
+             *   - 如果任务超前(vlag < 0): vruntime = V - vlag = V + |vlag| > V，可能进入future队列
+             *
+             * 注意: tctx->vlag是在stopping时保存的 V_old - vruntime_old
+             * 现在用当前V恢复: vruntime_new = V_new - vlag
+             */
+
+            // 获取保存的vlag
+            s64 vlag = tctx->vlag;
+
+            // 应用lag衰减/限制（参考Linux内核）
+            // 限制最大补偿和惩罚范围
+            s64 max_lag = (s64)slice_ns;  // 最多补偿一个slice
+            s64 min_lag = -(s64)(slice_ns / 2);  // 最多惩罚半个slice
+
+            if (vlag > max_lag) {
+                vlag = max_lag;  // 落后太多，限制补偿
+            } else if (vlag < min_lag) {
+                vlag = min_lag;  // 超前太多，限制惩罚
+            }
+
+            // 恢复vruntime = V - vlag（Linux内核公式）
+            v = sctx->V;
+            if (vlag >= 0) {
+                // 任务落后，vruntime = V - vlag < V，将进入ready队列
+                v = v >= (u64)vlag ? v - (u64)vlag : 0;
+            } else {
+                // 任务超前，vruntime = V - vlag = V + |vlag| > V
+                v = v + (u64)(-vlag);
+            }
+
+            // 更新vlag
+            tctx->vlag = vlag;
         }
 
         tctx->vruntime = v;
-        tctx->lag = lag;  // 更新保存的 lag（已 clamped）
     }
 
     n->ve = v;  // 虚拟就绪时间 = vruntime
@@ -391,17 +379,23 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     n->vd = n->ve + vslice;
     tctx->saved_vd = 0;
 
+    // 保存当前的V，用于判断任务应该进入哪个队列
+    u64 V_old = sctx->V;
+
+    // Eligible容忍区间（与dispatch保持一致）
+    u64 eligible_tolerance = vslice / 2;
+
     // 将任务加入负载统计
     eevdf_avg_add(sctx, n);
-    sctx->V = eevdf_calc_V(sctx);
 
-    // 将future队列中已合格的任务（ve <= V）转移到ready队列
+    // 将future队列中已eligible的任务转移到ready队列
+    // 使用容忍区间判断：ve <= V_old + tolerance
     int move_loops = 0;
     while (move_loops < MAX_DISPATCH_LOOPS) {
         fnode = bpf_rbtree_first(&sctx->future);
         if (!fnode) break;
         fn = container_of(fnode, struct eevdf_node, node);
-        if (fn->ve > sctx->V) break;  // 未合格，停止转移
+        if (fn->ve > V_old + eligible_tolerance) break;  // 不eligible
 
         fnode = bpf_rbtree_remove(&sctx->future, fnode);
         if (!fnode) break;
@@ -409,11 +403,29 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
         move_loops++;
     }
 
-    // 根据ve与V的关系决定入队位置
-    if (n->ve <= sctx->V)
-        bpf_rbtree_add(&sctx->ready, &n->node, less_ready);   // 合格树（按vd排序）
+    // 重新计算 V（基于所有任务的 vruntime 加权平均值）
+    // 这是 V 自然增长的核心机制
+    sctx->V = eevdf_calc_V(sctx);
+
+    /*
+     * [参考Linux内核的eligible判断]
+     *
+     * Linux EEVDF不是简单地判断 ve <= V，而是给予一定的容忍区间。
+     * 这允许稍微超前的任务也能被调度，避免因为精度问题导致的不公平。
+     *
+     * 容忍区间 = slice/2（与lag校准的max_ahead一致）
+     *
+     * 判断条件：ve <= V_old + tolerance
+     * 由于lag已经被限制到最多slice/2，所以：
+     *   ve = V_old + lag <= V_old + slice/2
+     * 这保证了唤醒的任务一定能进入ready队列。
+     */
+    u64 eligible_threshold = V_old + eligible_tolerance;
+
+    if (n->ve <= eligible_threshold)
+        bpf_rbtree_add(&sctx->ready, &n->node, less_ready);   // eligible，进入ready队列
     else
-        bpf_rbtree_add(&sctx->future, &n->node, less_future); // 不合格树（按ve排序）
+        bpf_rbtree_add(&sctx->future, &n->node, less_future); // not eligible，进入future队列
 
     bpf_spin_unlock(&sctx->lock);
 
@@ -440,36 +452,50 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     bpf_spin_lock(&sctx->lock);
 
     /*
-     * [关键修复] 饥饿问题修复
+     * [参考Linux内核的eligible机制]
      *
-     * 问题：当 ready 队列为空但 future 队列有任务时，
-     * 如果有其他 CPU 正在运行任务 (run_avg_load > 0)，
-     * V 不会更新，导致 future 队列中的任务永远无法变为"合格"。
+     * 使用eligible容忍区间来判断任务是否可调度。
+     * 容忍区间 = BASE_SLICE_NS / 2
      *
-     * 解决方案：当 ready 队列为空时，无条件检查 future 队列，
-     * 并将 V 更新到最小 ve，确保任务能够被调度。
+     * 这与enqueue中的eligible_threshold保持一致。
      */
+    u64 eligible_tolerance = BASE_SLICE_NS / 2;
+
     node = bpf_rbtree_first(&sctx->ready);
-    if (!node) {
-        // ready 队列为空，检查 future 队列
-        node = bpf_rbtree_first(&sctx->future);
-        if (node) {
-            n = container_of(node, struct eevdf_node, node);
-            // 强制更新 V 到 future 队列首个任务的 ve
-            // 这确保 future 中的任务可以立即变为"合格"
-            if (n->ve > sctx->V) {
-                sctx->V = n->ve;
+    bool ready_empty = !node;
+
+    // 检查 future 队列
+    struct bpf_rb_node *future_node = bpf_rbtree_first(&sctx->future);
+    if (future_node) {
+        struct eevdf_node *future_task = container_of(future_node, struct eevdf_node, node);
+
+        if (ready_empty) {
+            // ready 队列为空：强制更新 V，让 future 任务变为 eligible
+            // 使用容忍区间：V = ve - tolerance，这样 ve <= V + tolerance
+            if (future_task->ve > sctx->V + eligible_tolerance) {
+                sctx->V = future_task->ve - eligible_tolerance;
+            }
+        } else {
+            // ready 队列不为空：检查 future 任务是否接近 eligible
+            // 如果 ve 在容忍区间边缘，适度提升 V
+            if (future_task->ve > sctx->V + eligible_tolerance &&
+                future_task->ve <= sctx->V + BASE_SLICE_NS) {
+                u64 step = (future_task->ve - sctx->V - eligible_tolerance) / 2;
+                if (step > 0) {
+                    sctx->V = sctx->V + step;
+                }
             }
         }
     }
 
-    // Future -> Ready 转移
+    // Future -> Ready 转移（使用eligible容忍区间）
     int loops = 0;
     while (loops < MAX_DISPATCH_LOOPS) {
         node = bpf_rbtree_first(&sctx->future);
         if (!node) break;
         n = container_of(node, struct eevdf_node, node);
-        if (n->ve > sctx->V) break;
+        // 使用容忍区间判断eligible
+        if (n->ve > sctx->V + eligible_tolerance) break;
 
         node = bpf_rbtree_remove(&sctx->future, node);
         if (!node) break;
@@ -636,31 +662,21 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
     sctx->run_avg_vruntime_sum -= k;
     sctx->run_avg_load -= w;
 
-    // EEVDF 公式 (4): 当 client 离开竞争时，计算并保存 lag
-    if (tctx) {
-        // 计算 lag = vruntime - V
-        s64 lag = (s64)(tctx->vruntime - sctx->V);
-
-        // 保存 lag 到 task_ctx（在 enqueue 时使用）
-        tctx->lag = lag;
-
-        // 更新 V: V = V + lag / Σw_i
-        // 注意：这里的 total_weight 是离开后的权重（已经减去了当前任务）
-        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
-        if (total_weight > 0) {
-            // 使用乘倒数计算 lag / total_weight
-            u64 v_delta = eevdf_lag_div_weight(lag, total_weight);
-
-            // V = V + lag / total_weight
-            if (lag >= 0) {
-                sctx->V = sctx->V + v_delta;
-            } else {
-                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
-            }
-        }
-    }
-
+    // 重新计算 V（任务离开后，V 会自然调整）
     sctx->V = eevdf_calc_V(sctx);
+
+    /*
+     * [关键修复] 保存vlag = V - vruntime（Linux内核定义）
+     *
+     * vlag > 0: 任务落后于系统平均，唤醒时应该给予补偿
+     * vlag < 0: 任务超前于系统平均，唤醒时应该惩罚
+     *
+     * 这个vlag会在任务唤醒时被enqueue使用，恢复公式是:
+     *   vruntime = V_new - vlag
+     */
+    if (tctx) {
+        tctx->vlag = (s64)(sctx->V - tctx->vruntime);
+    }
 
     bpf_spin_unlock(&sctx->lock);
 
@@ -703,26 +719,10 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
 
         bpf_spin_lock(&sctx->lock);
 
-        // 处理重新加入时的 V 更新（公式 5 或 6）
-        // 之前已经执行了 V += lag / total_weight（离开）
-        // 现在需要执行 V -= lag / (total_weight + new_weight)（加入）
-        s64 lag = tctx->lag;
-        u64 total_weight = sctx->avg_load + sctx->run_avg_load;
-
-        if (total_weight > 0) {
-            u64 scaled_new_w = eevdf_scaled_weight(new_weight);
-            u64 v_delta = eevdf_lag_div_weight(lag, total_weight + scaled_new_w);
-
-            // V = V - lag / (total_weight + new_weight)
-            if (lag >= 0) {
-                sctx->V = sctx->V >= v_delta ? sctx->V - v_delta : 0;
-            } else {
-                sctx->V = sctx->V + v_delta;
-            }
-        }
-
         // 将任务加入统计
         eevdf_avg_add(sctx, n);
+
+        // 重新计算 V（任务重新加入后，V 会自然调整）
         sctx->V = eevdf_calc_V(sctx);
 
         // [修复] 移除future→ready转移，减少持锁时间

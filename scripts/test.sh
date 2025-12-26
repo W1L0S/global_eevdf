@@ -102,17 +102,33 @@ echo ""
 echo "[4/5] 运行测试..."
 echo "  ⏱ 开始时间: $(date '+%H:%M:%S')"
 
+# 在后台运行 stress-ng，避免阻塞
 if [ "$TEST_MODE" = "cpu" ]; then
     echo "  模式: CPU密集型"
-    timeout $((DURATION + 5))s stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief 2>&1 || {
-        echo "  ⚠ stress-ng 超时或失败"
-    }
+    stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief &
+    STRESS_PID=$!
 elif [ "$TEST_MODE" = "mixed" ]; then
     echo "  模式: 混合负载（CPU + I/O）"
-    timeout $((DURATION + 5))s stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief 2>&1 || {
-        echo "  ⚠ stress-ng 超时或失败"
-    }
+    stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief &
+    STRESS_PID=$!
 fi
+
+echo "  - stress-ng PID: $STRESS_PID"
+
+# 等待 stress-ng 完成（最多等待 DURATION + 5 秒）
+WAIT_COUNT=0
+while kill -0 $STRESS_PID 2>/dev/null; do
+    if [ $WAIT_COUNT -gt $((DURATION + 5)) ]; then
+        echo "  ⚠ stress-ng 超时，强制终止"
+        kill -9 $STRESS_PID 2>/dev/null || true
+        break
+    fi
+    sleep 1
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+# 确保 stress-ng 已停止
+wait $STRESS_PID 2>/dev/null || true
 
 echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
 

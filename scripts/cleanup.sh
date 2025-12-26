@@ -67,17 +67,23 @@ if [ "$DIAG_MODE" = true ]; then
 fi
 
 # 清理模式
-echo "[1/5] 强制停止所有stress-ng进程..."
+echo "[1/6] 强制停止所有stress-ng进程..."
 pkill -9 stress-ng 2>/dev/null || echo "  (没有stress-ng进程)"
 sleep 1
 
 echo ""
-echo "[2/5] 强制停止所有loader进程..."
+echo "[2/6] 强制停止所有tracebox/perfetto进程..."
+pkill -9 tracebox 2>/dev/null || echo "  (没有tracebox进程)"
+pkill -9 perfetto 2>/dev/null || echo "  (没有perfetto进程)"
+sleep 1
+
+echo ""
+echo "[3/6] 强制停止所有loader进程..."
 pkill -9 loader 2>/dev/null || echo "  (没有loader进程)"
 sleep 1
 
 echo ""
-echo "[3/5] 禁用调度器..."
+echo "[4/6] 禁用调度器..."
 if [ -f /sys/kernel/sched_ext/state ]; then
     echo 0 > /sys/kernel/sched_ext/state 2>/dev/null || echo "  (已禁用或无法访问)"
     STATE=$(cat /sys/kernel/sched_ext/state 2>/dev/null)
@@ -87,19 +93,21 @@ else
 fi
 
 echo ""
-echo "[4/5] 检查残留进程..."
+echo "[5/6] 检查残留进程..."
 STRESS_COUNT=$(ps aux | grep -c "[s]tress-ng")
 LOADER_COUNT=$(ps aux | grep -c "[l]oader")
-D_STATE_COUNT=$(ps aux | awk '$8 ~ /D/ && ($11 ~ /stress-ng/ || $11 ~ /loader/)' | wc -l)
+PERFETTO_COUNT=$(ps aux | grep -c "[t]racebox\|[p]erfetto")
+D_STATE_COUNT=$(ps aux | awk '$8 ~ /D/ && ($11 ~ /stress-ng/ || $11 ~ /loader/ || $11 ~ /tracebox/)' | wc -l)
 
 echo "  stress-ng进程: $STRESS_COUNT"
 echo "  loader进程: $LOADER_COUNT"
+echo "  tracebox/perfetto进程: $PERFETTO_COUNT"
 echo "  D状态进程: $D_STATE_COUNT"
 
-if [ $STRESS_COUNT -gt 0 ] || [ $LOADER_COUNT -gt 0 ]; then
+if [ $STRESS_COUNT -gt 0 ] || [ $LOADER_COUNT -gt 0 ] || [ $PERFETTO_COUNT -gt 0 ]; then
     echo ""
     echo "  ⚠ 仍有残留进程，显示详情:"
-    ps aux | grep -E "[s]tress-ng|[l]oader" | head -10
+    ps aux | grep -E "[s]tress-ng|[l]oader|[t]racebox|[p]erfetto" | head -10
     echo ""
     if [ $D_STATE_COUNT -gt 0 ]; then
         echo "  ⚠ 警告: 有 $D_STATE_COUNT 个D状态进程"
@@ -108,7 +116,7 @@ if [ $STRESS_COUNT -gt 0 ] || [ $LOADER_COUNT -gt 0 ]; then
 fi
 
 echo ""
-echo "[5/5] 清理ftrace..."
+echo "[6/6] 清理ftrace..."
 TRACE_DIR="/sys/kernel/tracing"
 if [ -d "$TRACE_DIR" ]; then
     echo 0 > $TRACE_DIR/tracing_on 2>/dev/null

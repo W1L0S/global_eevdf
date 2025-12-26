@@ -122,26 +122,25 @@ echo ""
 echo "[3/5] 运行测试负载..."
 echo "  ⏱ 开始时间: $(date '+%H:%M:%S')"
 
+# 在后台运行 stress-ng，避免阻塞
 if [ "$TEST_MODE" = "cpu" ]; then
     echo "  模式: CPU密集型"
-    timeout $((DURATION + 5))s stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief 2>&1 || {
-        echo "  ⚠ stress-ng 超时或失败"
-    }
+    stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief &
+    STRESS_PID=$!
 elif [ "$TEST_MODE" = "mixed" ]; then
     echo "  模式: 混合负载（CPU + I/O）"
-    timeout $((DURATION + 5))s stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief 2>&1 || {
-        echo "  ⚠ stress-ng 超时或失败"
-    }
+    stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief &
+    STRESS_PID=$!
 fi
 
-echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
+echo "  - stress-ng PID: $STRESS_PID"
 
 echo ""
-echo "[4/5] 等待 Perfetto 完成..."
-# 等待 Perfetto 完成（最多等待30秒）
+echo "[4/5] 等待测试完成..."
+# 等待 Perfetto 完成（它控制测试时长）
 WAIT_COUNT=0
 while kill -0 $PERFETTO_PID 2>/dev/null; do
-    if [ $WAIT_COUNT -gt 30 ]; then
+    if [ $WAIT_COUNT -gt $((DURATION + 10)) ]; then
         echo "  ⚠ Perfetto 超时，强制终止"
         kill -TERM $PERFETTO_PID 2>/dev/null || true
         break
@@ -152,6 +151,27 @@ done
 
 # 等待 Perfetto 进程完全结束
 wait $PERFETTO_PID 2>/dev/null || true
+
+echo "  ✓ Perfetto 已完成"
+
+# 停止 stress-ng（如果还在运行）
+if kill -0 $STRESS_PID 2>/dev/null; then
+    echo "  - 停止 stress-ng..."
+    kill -TERM $STRESS_PID 2>/dev/null || true
+    # 等待最多 5 秒
+    for i in {1..5}; do
+        if ! kill -0 $STRESS_PID 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    # 如果还没退出，强制杀死
+    if kill -0 $STRESS_PID 2>/dev/null; then
+        kill -9 $STRESS_PID 2>/dev/null || true
+    fi
+fi
+
+echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
 
 echo ""
 echo "[5/5] 停止调度器..."
