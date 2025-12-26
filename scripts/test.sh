@@ -9,7 +9,11 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 TRACE_DIR="/sys/kernel/tracing"
-TEXT_TRACE="$PROJECT_ROOT/scheduler_trace.txt"
+OUTPUT_DIR="$PROJECT_ROOT/output"
+TEXT_TRACE="$OUTPUT_DIR/scheduler_trace.txt"
+
+# 创建输出目录
+mkdir -p "$OUTPUT_DIR"
 
 # 默认参数
 TEST_MODE="cpu"  # cpu | mixed

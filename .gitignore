@@ -3,21 +3,13 @@ build/
 *.o
 *.a
 *.so
-*.lo
-*.la
-*.skel.h
-*.bpf.o
 
-# 可执行文件
-loader
+# 输出文件（trace 和分析结果）
+output/
 
-# Trace 文件
-*.txt
-*.dat
-*.perfetto
-*.perfetto-trace
-*.log
-scheduler_trace.*
+# Perfetto 工具和配置
+tools/
+.perfetto_config_temp.pbtx
 
 # IDE 和编辑器
 .vscode/
@@ -30,5 +22,5 @@ scheduler_trace.*
 # Claude 临时文件
 .claude/
 
-# Zone Identifier（Windows WSL）
+# WSL Zone Identifier
 *:Zone.Identifier

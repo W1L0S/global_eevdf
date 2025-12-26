@@ -7,7 +7,9 @@ if [ -z "$TRACE_FILE" ]; then
     echo "用法: $0 <trace_file>"
     echo ""
     echo "示例:"
-    echo "  $0 scheduler_trace.txt"
+    echo "  $0 output/scheduler_trace.txt"
+    echo ""
+    echo "提示: 运行测试后会在 output/ 目录生成 trace 文件"
     exit 1
 fi
 
