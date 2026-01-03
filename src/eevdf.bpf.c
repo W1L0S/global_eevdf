@@ -525,6 +525,7 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         u64 w_val = eevdf_scaled_weight(n->weight);
         s64 key_val = (s64)(n->ve - sctx->base_v) * (s64)w_val;
         s32 pid = n->pid;
+        u64 ve = n->ve;
         u64 vd = n->vd;
         u64 wmult = n->wmult;
         u64 slice = n->slice_ns;
@@ -564,8 +565,11 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
             bpf_spin_unlock(&sctx->lock);
 
             scx_bpf_dispatch(p, dsq_id, slice, 0);
-            // 使用 IDLE kick 而不是 PREEMPT，减少 softirq 压力
-            scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
+            u64 idle = scx_bpf_test_and_clear_cpu_idle(target_cpu);
+            if (idle)
+                scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
+            else
+                eevdf_kick_preempt_if_needed(p, ve, vd, (u64)-1);
 
             bpf_task_release(p);
             bpf_obj_drop(n);
