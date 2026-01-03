@@ -111,6 +111,40 @@ while read line; do
 done
 echo ""
 
+# 唤醒延迟分析（近似：sched_wakeup -> 下次被切入运行）
+echo "[6] 唤醒到运行延迟（stress-ng，近似）"
+echo "---"
+awk '
+/sched_wakeup:.*comm=stress-ng/ {
+    ts=$4; sub(/:/, "", ts);
+    if (match($0, / pid=([0-9]+)/, m)) {
+        wake[m[1]] = ts;
+    }
+    next;
+}
+/sched_switch:.*next_comm=stress-ng/ {
+    ts=$4; sub(/:/, "", ts);
+    if (match($0, / next_pid=([0-9]+)/, m)) {
+        pid=m[1];
+        if (pid in wake) {
+            d=(ts - wake[pid]) * 1000.0;
+            sum += d;
+            cnt += 1;
+            if (d > max) max = d;
+            delete wake[pid];
+        }
+    }
+    next;
+}
+END {
+    if (cnt > 0)
+        printf("  样本: %d, 平均: %.3f ms, 最大: %.3f ms\n", cnt, sum/cnt, max);
+    else
+        print "  (无可用样本：未匹配到 stress-ng 的 sched_wakeup -> sched_switch 切入)";
+}
+' "$TRACE_FILE"
+echo ""
+
 # 全局统计
 echo "========================================"
 echo "总结"

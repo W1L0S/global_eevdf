@@ -2,14 +2,14 @@
 
 ## 项目概述
 
-本项目是一个基于 Linux 6.12.57 sched_ext 框架的 **全局队列 EEVDF (Earliest Eligible Virtual Deadline First) 调度器**，使用 eBPF 技术实现。完整实现了 Linux 内核 EEVDF 规范的 lag 补偿机制、权重动态变更处理和虚拟时间管理系统。
+本项目是一个基于 Linux 6.12.57 sched_ext 框架的 **全局队列 EEVDF (Earliest Eligible Virtual Deadline First) 调度器**，使用 eBPF 技术实现。实现了双红黑树的 EEVDF 选择逻辑、基于 `vlag = V - vruntime` 的唤醒补偿、以及唤醒抢占检查机制，并对 I/O 密集场景做了 kick 风暴抑制。
 
 ## 核心设计原则
 
-1. **符合内核规范**：完整实现 EEVDF 论文的公式 (4), (5), (6)，lag 补偿机制与 Linux 内核一致
-2. **简洁高效**：使用乘倒数代替除法，优化 BPF 性能，避免复杂的抢占逻辑
+1. **符合内核语义**：严格按 `ve <= V` 判定 eligible，按 `vd` 选择最早 deadline 的任务，并在唤醒路径执行抢占检查
+2. **简洁高效**：唤醒抢占判断保持 O(1)，避免在热路径引入额外分配与扫描
 3. **全局公平**：使用全局队列，确保所有任务公平调度
-4. **防止饥饿**：通过 EEVDF 算法的 deadline 机制和 lag clamp，保证任务不会被长期饿死
+4. **防止饥饿**：通过 deadline 机制与 `V` 追赶 future.ve，保证任务不会被长期饿死
 
 ---
 
@@ -111,6 +111,25 @@ vlag = V - vruntime
 - `eevdf_clamp_lag()` / `eevdf_lag_div_weight()` 作为工具函数保留，但当前主路径以 `eevdf_calc_V()` 为准
 
 ---
+
+### 2.5 唤醒抢占检查（wakeup preempt）
+
+唤醒任务入队完成后，如果新任务已经 eligible 且其虚拟截止时间更早，则触发目标 CPU 重新调度。为避免 I/O 密集场景频繁唤醒带来的 kick 风暴，引入抢占粒度与每 CPU 限频。
+
+判定条件（核心语义）：
+
+- `new_ve <= V_now`（eligible）
+- `new_vd < curr_vd`（更早 deadline）
+
+风暴抑制：
+
+- 抢占粒度：仅当 `new_vd + WAKEUP_PREEMPT_GRAN_NS < curr_vd` 才抢占
+- 限频：每 CPU 两次 kick 之间至少间隔 `WAKEUP_KICK_MIN_INTERVAL_NS`
+
+执行机制：
+
+- CPU idle 时使用 `SCX_KICK_IDLE`
+- 否则使用 `SCX_KICK_PREEMPT`
 
 ### 3. 双红黑树系统
 
@@ -424,6 +443,8 @@ struct run_accounting {
 | `MIN_SLICE_NS` | 1ms | 最小时间片常量（当前未用于 slice 计算） |
 | `EEVDF_PERIOD_NS` | 12ms | 周期常量（当前未用于 slice 计算） |
 | `LAG_CLAMP_NS` | 9ms (3x) | 数值稳定性阈值相关常量（配合 base_v rebasing） |
+| `WAKEUP_PREEMPT_GRAN_NS` | 200µs | 唤醒抢占粒度（避免频繁抖动与抢占风暴） |
+| `WAKEUP_KICK_MIN_INTERVAL_NS` | 200µs | 每 CPU kick 限频（避免 I/O 密集 softirq 堆积） |
 | `MAX_DISPATCH_LOOPS` | 4 | future→ready 转移循环上界 |
 | `MAX_PEEK_LOOPS` | 8 | dispatch 查找循环上界 |
 
@@ -454,7 +475,7 @@ struct run_accounting {
    - 防止 BPF verifier 拒绝无界循环
    - 防止持锁时间过长导致 Hard Lockup
    - future→ready 转移循环上界：4 次（MAX_DISPATCH_LOOPS）
-  - dispatch 查找循环上界：8 次（MAX_PEEK_LOOPS）
+   - dispatch 查找循环上界：8 次（MAX_PEEK_LOOPS）
 
 3. **内存分配**：
    - 使用 `bpf_obj_new/drop` 管理 eevdf_node
@@ -473,6 +494,7 @@ struct run_accounting {
 
 3. **I/O 密集型负载**：频繁睡眠唤醒会增加锁竞争
    - 优化：stopping 中不做树间转移
+   - 优化：唤醒抢占带粒度与每 CPU 限频，避免 NOHZ/softirq 压力
    - 仍可能在极高 I/O 压力下出现性能下降
 
 ---

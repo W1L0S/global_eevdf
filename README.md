@@ -2,7 +2,7 @@
 
 基于 Linux 6.12+ sched_ext 框架的 **EEVDF (Earliest Eligible Virtual Deadline First)** 调度器 eBPF 实现。
 
-完整实现了 Linux 内核 EEVDF 规范的 lag 补偿机制和虚拟时间管理系统。
+实现了基于 sched_ext 的 EEVDF 选择逻辑、`vlag = V - vruntime` 唤醒补偿与唤醒抢占检查，并对 I/O 密集场景做了 kick 风暴抑制。
 
 ## 快速开始
 
@@ -41,6 +41,8 @@ sudo ./scripts/test_perfetto.sh
 ./scripts/analyze.sh output/scheduler_trace.txt
 ```
 
+分析脚本会输出“唤醒到运行延迟（近似）”指标，用于观察 I/O 唤醒响应。
+
 所有输出文件位于 `output/` 目录。
 
 ---
@@ -48,10 +50,11 @@ sudo ./scripts/test_perfetto.sh
 ## 核心特性
 
 - ✅ **完整的 EEVDF 算法**：基于 deadline 的公平调度
-- ✅ **Lag 补偿机制**：为交互式任务提供延迟补偿
+- ✅ **唤醒补偿机制**：使用 `vlag = V - vruntime` 恢复交互任务进度
 - ✅ **权重动态变更**：自动处理 nice 值和 cgroup 权重变化
 - ✅ **双红黑树设计**：合格/不合格树分离，高效任务选择
 - ✅ **防饥饿保证**：lag clamp 机制确保公平性
+- ✅ **唤醒抢占检查**：eligible 且更早 vd 时触发抢占（带粒度/限频）
 
 详细算法说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -67,6 +70,7 @@ sudo ./scripts/test.sh [选项]
 选项:
   --cpu-only       CPU 密集型测试（默认）
   --mixed          混合负载（CPU + I/O）
+  --io-only        I/O 密集型测试（频繁睡眠/唤醒）
   --duration N     测试时长（秒，默认10）
 ```
 
@@ -93,6 +97,7 @@ sudo ./scripts/test_perfetto.sh [选项]
 选项:
   --cpu-only       CPU 密集型测试（默认）
   --mixed          混合负载（CPU + I/O）
+  --io-only        I/O 密集型测试（频繁睡眠/唤醒）
   --duration N     测试时长（秒，默认10）
 ```
 
@@ -155,41 +160,28 @@ my-eevdf-scheduler/
 
 ## 核心算法
 
-### Lag 补偿
+### 唤醒补偿（vlag）
 
-EEVDF 通过 lag 机制实现公平性和交互响应：
+本实现使用 `vlag` 在睡眠/唤醒之间保存任务相对进度，并在 `enqueue` 时恢复：
 
 ```
-lag = vruntime - V
-```
-
-- `lag < 0`：任务落后，获得补偿（更高优先级）
-- `lag > 0`：任务超前，降低优先级
-- `lag = 0`：任务与系统同步
-
-### EEVDF 公式
-
-**公式 (4) - 任务离开**：
-```
-V = V + lag / Σw_i
+vlag = V - vruntime
 ```
 
-**公式 (5) - 任务加入**：
-```
-V = V - lag / (Σw_i + w_j)
-```
+- `vlag > 0`：任务落后于系统平均，唤醒时获得一定补偿
+- `vlag < 0`：任务超前于系统平均，唤醒时受到一定惩罚
+- `vlag = 0`：任务与系统同步
 
-**公式 (6) - 权重变更**：
-```
-V = V + lag/(Σw_i - w_old) - lag/(Σw_i - w_old + w_new)
-```
+### 唤醒抢占检查（wakeup preempt）
+
+新任务入队后，如果满足 `ve <= V` 且 `new_vd` 明显早于当前运行任务的 `curr_vd`，则向目标 CPU 发送 `SCX_KICK_PREEMPT` 触发重调度；为避免 I/O 密集场景 kick 风暴，增加了抢占粒度与每 CPU 限频。
 
 ### 双红黑树
 
 - **Ready Tree**：存放 `ve ≤ V` 的任务，按 deadline 排序
 - **Future Tree**：存放 `ve > V` 的任务，按就绪时间排序
 
-详细说明见 [ARCHITECTURE.md](ARCHITECTURE.md)
+详细说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
 
@@ -220,6 +212,8 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 #define BASE_SLICE_NS   3000000ULL   // 基础时间片（3ms）
 #define EEVDF_PERIOD_NS 12000000ULL  // 调度周期（12ms）
 #define LAG_CLAMP_NS    (BASE_SLICE_NS * 3ULL)  // Lag clamp（9ms）
+#define WAKEUP_PREEMPT_GRAN_NS       200000ULL  // 唤醒抢占粒度
+#define WAKEUP_KICK_MIN_INTERVAL_NS  200000ULL  // 每 CPU kick 最小间隔
 ```
 
 - **提高响应性**：减小 `BASE_SLICE_NS`（如 2ms）

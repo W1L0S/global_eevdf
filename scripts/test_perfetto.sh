@@ -18,7 +18,7 @@ CONFIG_FILE="$PROJECT_ROOT/perfetto_config.pbtx"
 TRACE_FILE="$OUTPUT_DIR/eevdf_trace.perfetto-trace"
 
 # 默认参数
-TEST_MODE="cpu"  # cpu | mixed
+TEST_MODE="cpu"  # cpu | mixed | io
 DURATION=10
 
 # 解析命令行参数
@@ -32,6 +32,10 @@ while [[ $# -gt 0 ]]; do
             TEST_MODE="mixed"
             shift
             ;;
+        --io-only)
+            TEST_MODE="io"
+            shift
+            ;;
         --duration)
             DURATION="$2"
             shift 2
@@ -42,6 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "选项:"
             echo "  --cpu-only       仅测试CPU密集型负载（默认）"
             echo "  --mixed          测试混合负载（CPU + I/O）"
+            echo "  --io-only        测试 I/O 密集型负载（频繁睡眠/唤醒）"
             echo "  --duration N     测试时长（秒，默认10）"
             echo "  -h, --help       显示此帮助信息"
             exit 0
@@ -130,6 +135,10 @@ if [ "$TEST_MODE" = "cpu" ]; then
 elif [ "$TEST_MODE" = "mixed" ]; then
     echo "  模式: 混合负载（CPU + I/O）"
     stress-ng --cpu 2 --io 2 --timeout ${DURATION}s --metrics-brief &
+    STRESS_PID=$!
+elif [ "$TEST_MODE" = "io" ]; then
+    echo "  模式: I/O密集型（hdd，频繁睡眠/唤醒）"
+    stress-ng --hdd 4 --timeout ${DURATION}s --metrics-brief &
     STRESS_PID=$!
 fi
 

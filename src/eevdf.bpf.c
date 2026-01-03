@@ -15,6 +15,9 @@
 #define MAX_DISPATCH_LOOPS 4
 #define MAX_PEEK_LOOPS     8
 
+#define WAKEUP_PREEMPT_GRAN_NS       200000ULL
+#define WAKEUP_KICK_MIN_INTERVAL_NS  200000ULL
+
 #include "../../tools/sched_ext/include/scx/common.bpf.h"
 
 /* --- Lookup Tables --- */
@@ -109,6 +112,13 @@ struct {
     __type(value, struct run_accounting);
 } cpu_run_account SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_CPUS);
+    __type(key, u32);
+    __type(value, u64);
+} cpu_last_kick_ns SEC(".maps");
+
 /* --- Internal Helpers --- */
 
 static __always_inline void eevdf_avg_add(struct eevdf_ctx_t *sctx, struct eevdf_node *n);
@@ -141,6 +151,45 @@ static __always_inline u64 eevdf_lag_div_weight(s64 lag, u64 total_weight)
     u64 delta = (abs_lag * inv_weight) >> 32;
 
     return delta;
+}
+
+static __always_inline void eevdf_kick_preempt_if_needed(struct task_struct *p,
+                                                         u64 new_ve, u64 new_vd,
+                                                         u64 V_now)
+{
+    if (new_ve > V_now) return;
+
+    s32 cpu = scx_bpf_task_cpu(p);
+    if (cpu < 0 || cpu >= MAX_CPUS) return;
+    u32 cpu_idx = (u32)cpu;
+
+    u64 now_ns = bpf_ktime_get_ns();
+    u64 *last_kick = bpf_map_lookup_elem(&cpu_last_kick_ns, &cpu_idx);
+    if (last_kick && now_ns - *last_kick < WAKEUP_KICK_MIN_INTERVAL_NS)
+        return;
+
+    struct rq *rq = scx_bpf_cpu_rq(cpu);
+    if (!rq) return;
+
+    struct task_struct *curr = rq->curr;
+    if (!curr) return;
+
+    if (curr->pid == p->pid) return;
+
+    struct task_ctx *ct = bpf_task_storage_get(&task_ctx_stor, curr, 0, 0);
+    if (!ct) return;
+
+    u64 curr_vd = ct->saved_vd;
+    if (!curr_vd) return;
+
+    if (new_vd + WAKEUP_PREEMPT_GRAN_NS >= curr_vd)
+        return;
+
+    if (last_kick)
+        *last_kick = now_ns;
+
+    u64 flags = scx_bpf_test_and_clear_cpu_idle(cpu) ? SCX_KICK_IDLE : SCX_KICK_PREEMPT;
+    scx_bpf_kick_cpu(cpu, flags);
 }
 
 static bool less_ready(struct bpf_rb_node *a, const struct bpf_rb_node *b)
@@ -352,6 +401,9 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     n->vd = n->ve + vslice;
     tctx->saved_vd = 0;
 
+    u64 new_ve = n->ve;
+    u64 new_vd = n->vd;
+
     // 保存当前的V，用于判断任务应该进入哪个队列
     u64 V_old = sctx->V;
 
@@ -376,6 +428,7 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     // 重新计算 V（基于所有任务的 vruntime 加权平均值）
     // 这是 V 自然增长的核心机制
     sctx->V = eevdf_calc_V(sctx);
+    u64 V_now = sctx->V;
 
     /*
      * [Eligible 判断调整]
@@ -388,6 +441,8 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
         bpf_rbtree_add(&sctx->future, &n->node, less_future); // not eligible，进入future队列
 
     bpf_spin_unlock(&sctx->lock);
+
+    eevdf_kick_preempt_if_needed(p, new_ve, new_vd, V_now);
 
     return 0;
 }
@@ -510,7 +565,7 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
             scx_bpf_dispatch(p, dsq_id, slice, 0);
             // 使用 IDLE kick 而不是 PREEMPT，减少 softirq 压力
-            scx_bpf_kick_cpu(target_cpu, 0);
+            scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
 
             bpf_task_release(p);
             bpf_obj_drop(n);
