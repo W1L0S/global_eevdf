@@ -194,30 +194,9 @@ static __always_inline void eevdf_compute_weight(struct task_struct *p, int idx,
 
 static __always_inline u64 eevdf_calculate_slice(struct task_struct *p)
 {
-    int idx = p->static_prio - MAX_RT_PRIO;
-    if (idx < 0) idx = 0;
-    if (idx >= 40) idx = 39;
-
-    int latency_nice = idx - 20;
-    int factor = 1024 + latency_nice * 64;
-
-    if (factor < 256) factor = 256;
-    if (factor > 4096) factor = 4096;
-
-    u32 key = 0;
-    struct eevdf_ctx_t *sctx = bpf_map_lookup_elem(&eevdf_ctx, &key);
-    u64 total_load = 0;
-    if (sctx)
-        total_load = sctx->avg_load + sctx->run_avg_load;
-
-    if (total_load == 0) total_load = 1;
-
-    u64 slice_ns = EEVDF_PERIOD_NS / total_load;
-    slice_ns = (slice_ns * factor) >> 10;
-
-    if (slice_ns < MIN_SLICE_NS) slice_ns = MIN_SLICE_NS;
-
-    return slice_ns;
+    // 简化设计：所有任务统一使用 3ms 时间片
+    // 调度差异主要由权重(weight)决定的虚拟时间片(vslice)来体现
+    return 3000000ULL;
 }
 
 static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
@@ -382,20 +361,17 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     // 保存当前的V，用于判断任务应该进入哪个队列
     u64 V_old = sctx->V;
 
-    // Eligible容忍区间（与dispatch保持一致）
-    u64 eligible_tolerance = vslice / 2;
-
     // 将任务加入负载统计
     eevdf_avg_add(sctx, n);
 
     // 将future队列中已eligible的任务转移到ready队列
-    // 使用容忍区间判断：ve <= V_old + tolerance
+    // 严格判断：ve <= V_old
     int move_loops = 0;
     while (move_loops < MAX_DISPATCH_LOOPS) {
         fnode = bpf_rbtree_first(&sctx->future);
         if (!fnode) break;
         fn = container_of(fnode, struct eevdf_node, node);
-        if (fn->ve > V_old + eligible_tolerance) break;  // 不eligible
+        if (fn->ve > V_old) break;  // 不eligible
 
         fnode = bpf_rbtree_remove(&sctx->future, fnode);
         if (!fnode) break;
@@ -408,21 +384,11 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     sctx->V = eevdf_calc_V(sctx);
 
     /*
-     * [参考Linux内核的eligible判断]
-     *
-     * Linux EEVDF不是简单地判断 ve <= V，而是给予一定的容忍区间。
-     * 这允许稍微超前的任务也能被调度，避免因为精度问题导致的不公平。
-     *
-     * 容忍区间 = slice/2（与lag校准的max_ahead一致）
-     *
-     * 判断条件：ve <= V_old + tolerance
-     * 由于lag已经被限制到最多slice/2，所以：
-     *   ve = V_old + lag <= V_old + slice/2
-     * 这保证了唤醒的任务一定能进入ready队列。
+     * [Eligible 判断调整]
+     * 严格按照 EEVDF 定义：ve <= V 即为 eligible。
+     * 移除容忍区间，简化逻辑。
      */
-    u64 eligible_threshold = V_old + eligible_tolerance;
-
-    if (n->ve <= eligible_threshold)
+    if (n->ve <= sctx->V)
         bpf_rbtree_add(&sctx->ready, &n->node, less_ready);   // eligible，进入ready队列
     else
         bpf_rbtree_add(&sctx->future, &n->node, less_future); // not eligible，进入future队列
@@ -451,16 +417,6 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
     bpf_spin_lock(&sctx->lock);
 
-    /*
-     * [参考Linux内核的eligible机制]
-     *
-     * 使用eligible容忍区间来判断任务是否可调度。
-     * 容忍区间 = BASE_SLICE_NS / 2
-     *
-     * 这与enqueue中的eligible_threshold保持一致。
-     */
-    u64 eligible_tolerance = BASE_SLICE_NS / 2;
-
     node = bpf_rbtree_first(&sctx->ready);
     bool ready_empty = !node;
 
@@ -471,31 +427,21 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 
         if (ready_empty) {
             // ready 队列为空：强制更新 V，让 future 任务变为 eligible
-            // 使用容忍区间：V = ve - tolerance，这样 ve <= V + tolerance
-            if (future_task->ve > sctx->V + eligible_tolerance) {
-                sctx->V = future_task->ve - eligible_tolerance;
-            }
-        } else {
-            // ready 队列不为空：检查 future 任务是否接近 eligible
-            // 如果 ve 在容忍区间边缘，适度提升 V
-            if (future_task->ve > sctx->V + eligible_tolerance &&
-                future_task->ve <= sctx->V + BASE_SLICE_NS) {
-                u64 step = (future_task->ve - sctx->V - eligible_tolerance) / 2;
-                if (step > 0) {
-                    sctx->V = sctx->V + step;
-                }
+            // 严格对齐：V = ve，这样 ve <= V 成立
+            if (future_task->ve > sctx->V) {
+                sctx->V = future_task->ve;
             }
         }
     }
 
-    // Future -> Ready 转移（使用eligible容忍区间）
+    // Future -> Ready 转移（严格 Eligible 判断）
     int loops = 0;
     while (loops < MAX_DISPATCH_LOOPS) {
         node = bpf_rbtree_first(&sctx->future);
         if (!node) break;
         n = container_of(node, struct eevdf_node, node);
-        // 使用容忍区间判断eligible
-        if (n->ve > sctx->V + eligible_tolerance) break;
+        // 严格判断eligible
+        if (n->ve > sctx->V) break;
 
         node = bpf_rbtree_remove(&sctx->future, node);
         if (!node) break;
