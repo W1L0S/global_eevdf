@@ -2,18 +2,59 @@
 # EEVDF 调度器主测试脚本
 # 支持 CPU / 混合负载 / I/O 密集负载测试
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-TRACE_DIR="/sys/kernel/tracing"
+if [ -d "/sys/kernel/tracing" ]; then
+    TRACE_DIR="/sys/kernel/tracing"
+elif [ -d "/sys/kernel/debug/tracing" ]; then
+    TRACE_DIR="/sys/kernel/debug/tracing"
+else
+    echo "错误：未找到 ftrace 目录（/sys/kernel/tracing 或 /sys/kernel/debug/tracing）"
+    exit 1
+fi
 OUTPUT_DIR="$PROJECT_ROOT/output"
 TEXT_TRACE="$OUTPUT_DIR/scheduler_trace.txt"
 
 # 创建输出目录
 mkdir -p "$OUTPUT_DIR"
+
+LOADER_PID=""
+STRESS_PID=""
+
+cleanup() {
+    echo 0 > "$TRACE_DIR/tracing_on" 2>/dev/null || true
+    echo 0 > "$TRACE_DIR/events/sched/sched_switch/enable" 2>/dev/null || true
+    echo 0 > "$TRACE_DIR/events/sched/sched_wakeup/enable" 2>/dev/null || true
+    echo nop > "$TRACE_DIR/current_tracer" 2>/dev/null || true
+
+    if [ -n "${STRESS_PID:-}" ] && kill -0 "$STRESS_PID" 2>/dev/null; then
+        kill -TERM "$STRESS_PID" 2>/dev/null || true
+        for _ in {1..5}; do
+            if ! kill -0 "$STRESS_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -KILL "$STRESS_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${LOADER_PID:-}" ] && kill -0 "$LOADER_PID" 2>/dev/null; then
+        kill -TERM "$LOADER_PID" 2>/dev/null || true
+        for _ in {1..5}; do
+            if ! kill -0 "$LOADER_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -KILL "$LOADER_PID" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT INT TERM
 
 # 默认参数
 TEST_MODE="cpu"  # cpu | mixed | io
@@ -71,20 +112,30 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+if [ ! -x "./build/loader" ]; then
+    echo "错误：未找到 ./build/loader，请先运行 make"
+    exit 1
+fi
+
+if ! command -v stress-ng >/dev/null 2>&1; then
+    echo "错误：未找到 stress-ng，请先安装 stress-ng"
+    exit 1
+fi
+
 # 清理旧文件
 rm -f "$TEXT_TRACE"
 
 echo "[1/5] 配置 ftrace..."
-echo 0 > $TRACE_DIR/tracing_on
-echo > $TRACE_DIR/trace
-echo 8192 > $TRACE_DIR/buffer_size_kb
-echo 1 > $TRACE_DIR/events/sched/sched_switch/enable
-echo 1 > $TRACE_DIR/events/sched/sched_wakeup/enable
-echo nop > $TRACE_DIR/current_tracer
+echo 0 > "$TRACE_DIR/tracing_on"
+echo > "$TRACE_DIR/trace"
+echo 8192 > "$TRACE_DIR/buffer_size_kb"
+echo 1 > "$TRACE_DIR/events/sched/sched_switch/enable"
+echo 1 > "$TRACE_DIR/events/sched/sched_wakeup/enable"
+echo nop > "$TRACE_DIR/current_tracer"
 
 echo ""
 echo "[2/5] 启动 ftrace..."
-echo 1 > $TRACE_DIR/tracing_on
+echo 1 > "$TRACE_DIR/tracing_on"
 
 echo ""
 echo "[3/5] 启动 EEVDF 调度器..."
@@ -143,20 +194,14 @@ echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
 
 echo ""
 echo "[5/5] 停止收集..."
-echo 0 > $TRACE_DIR/tracing_on
-
-# 停止调度器
-echo "  - 停止调度器..."
-kill -SIGTERM $LOADER_PID 2>/dev/null || true
-wait $LOADER_PID 2>/dev/null || true
-sleep 1
+echo 0 > "$TRACE_DIR/tracing_on"
 
 # 导出trace
-cat $TRACE_DIR/trace > "$TEXT_TRACE"
+cat "$TRACE_DIR/trace" > "$TEXT_TRACE"
 
 # 禁用事件
-echo 0 > $TRACE_DIR/events/sched/sched_switch/enable
-echo 0 > $TRACE_DIR/events/sched/sched_wakeup/enable
+echo 0 > "$TRACE_DIR/events/sched/sched_switch/enable"
+echo 0 > "$TRACE_DIR/events/sched/sched_wakeup/enable"
 
 TRACE_LINES=$(wc -l < "$TEXT_TRACE")
 

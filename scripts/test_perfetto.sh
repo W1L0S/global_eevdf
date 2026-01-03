@@ -2,7 +2,7 @@
 # EEVDF 调度器 Perfetto 测试脚本
 # 使用 Perfetto 捕获高质量的调度器 trace
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -14,12 +14,58 @@ mkdir -p "$OUTPUT_DIR"
 
 # 使用 tracebox（独立模式，不需要后台服务）
 PERFETTO_BIN="$PROJECT_ROOT/tools/perfetto/tracebox"
-CONFIG_FILE="$PROJECT_ROOT/perfetto_config.pbtx"
+CONFIG_FILE="$PROJECT_ROOT/configs/perfetto_config.pbtx"
 TRACE_FILE="$OUTPUT_DIR/eevdf_trace.perfetto-trace"
 
 # 默认参数
 TEST_MODE="cpu"  # cpu | mixed | io
 DURATION=10
+
+LOADER_PID=""
+PERFETTO_PID=""
+STRESS_PID=""
+TEMP_CONFIG=""
+
+cleanup() {
+    if [ -n "${STRESS_PID:-}" ] && kill -0 "$STRESS_PID" 2>/dev/null; then
+        kill -TERM "$STRESS_PID" 2>/dev/null || true
+        for _ in {1..5}; do
+            if ! kill -0 "$STRESS_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -KILL "$STRESS_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${PERFETTO_PID:-}" ] && kill -0 "$PERFETTO_PID" 2>/dev/null; then
+        kill -TERM "$PERFETTO_PID" 2>/dev/null || true
+        for _ in {1..5}; do
+            if ! kill -0 "$PERFETTO_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -KILL "$PERFETTO_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${LOADER_PID:-}" ] && kill -0 "$LOADER_PID" 2>/dev/null; then
+        kill -TERM "$LOADER_PID" 2>/dev/null || true
+        for _ in {1..5}; do
+            if ! kill -0 "$LOADER_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -KILL "$LOADER_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${TEMP_CONFIG:-}" ]; then
+        rm -f "$TEMP_CONFIG" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT INT TERM
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -90,13 +136,17 @@ fi
 rm -f "$TRACE_FILE"
 
 # 创建临时配置文件，使用用户指定的持续时间
-TEMP_CONFIG="$PROJECT_ROOT/.perfetto_config_temp.pbtx"
 DURATION_MS=$((DURATION * 1000))
+TEMP_CONFIG="$(mktemp -p "$PROJECT_ROOT" .perfetto_config.XXXXXX.pbtx)"
 
 # 复制配置文件并替换持续时间
-sed "s/duration_ms: [0-9]*/duration_ms: $DURATION_MS/" "$CONFIG_FILE" > "$TEMP_CONFIG"
+sed "0,/duration_ms: [0-9]*/s//duration_ms: $DURATION_MS/" "$CONFIG_FILE" > "$TEMP_CONFIG"
 
 echo "[1/5] 启动 EEVDF 调度器..."
+if [ ! -x "./build/loader" ]; then
+    echo "错误：未找到 ./build/loader，请先运行 make"
+    exit 1
+fi
 ./build/loader &
 LOADER_PID=$!
 echo "  - Loader PID: $LOADER_PID"
@@ -128,6 +178,10 @@ echo "[3/5] 运行测试负载..."
 echo "  ⏱ 开始时间: $(date '+%H:%M:%S')"
 
 # 在后台运行 stress-ng，避免阻塞
+if ! command -v stress-ng >/dev/null 2>&1; then
+    echo "错误：未找到 stress-ng，请先安装 stress-ng"
+    exit 1
+fi
 if [ "$TEST_MODE" = "cpu" ]; then
     echo "  模式: CPU密集型"
     stress-ng --cpu 4 --timeout ${DURATION}s --metrics-brief &
@@ -184,17 +238,20 @@ echo "  ⏱ 结束时间: $(date '+%H:%M:%S')"
 
 echo ""
 echo "[5/5] 停止调度器..."
-kill -SIGTERM $LOADER_PID 2>/dev/null || true
-wait $LOADER_PID 2>/dev/null || true
 sleep 1
-
-# 清理临时配置文件
-rm -f "$TEMP_CONFIG"
+if [ -n "${LOADER_PID:-}" ] && kill -0 "$LOADER_PID" 2>/dev/null; then
+    kill -TERM "$LOADER_PID" 2>/dev/null || true
+    wait "$LOADER_PID" 2>/dev/null || true
+fi
 
 # 验证 trace 文件
 if [ -f "$TRACE_FILE" ]; then
     SIZE=$(stat -c%s "$TRACE_FILE")
-    SIZE_MB=$(echo "scale=2; $SIZE / 1048576" | bc)
+    if command -v bc >/dev/null 2>&1; then
+        SIZE_MB=$(echo "scale=2; $SIZE / 1048576" | bc)
+    else
+        SIZE_MB=$(awk -v s="$SIZE" 'BEGIN { printf("%.2f", s / 1048576) }')
+    fi
 
     # 修改文件权限，让普通用户可以读取
     # 获取真实用户（即使通过 sudo 运行）

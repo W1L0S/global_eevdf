@@ -168,18 +168,17 @@ static __always_inline void eevdf_kick_preempt_if_needed(struct task_struct *p,
     if (last_kick && now_ns - *last_kick < WAKEUP_KICK_MIN_INTERVAL_NS)
         return;
 
-    struct rq *rq = scx_bpf_cpu_rq(cpu);
-    if (!rq) return;
+    if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
+        if (last_kick)
+            *last_kick = now_ns;
+        scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+        return;
+    }
 
-    struct task_struct *curr = rq->curr;
-    if (!curr) return;
+    struct run_accounting *acct = bpf_map_lookup_elem(&cpu_run_account, &cpu_idx);
+    if (!acct || !acct->valid) return;
 
-    if (curr->pid == p->pid) return;
-
-    struct task_ctx *ct = bpf_task_storage_get(&task_ctx_stor, curr, 0, 0);
-    if (!ct) return;
-
-    u64 curr_vd = ct->saved_vd;
+    u64 curr_vd = acct->curr_vd;
     if (!curr_vd) return;
 
     if (new_vd + WAKEUP_PREEMPT_GRAN_NS >= curr_vd)
@@ -188,8 +187,7 @@ static __always_inline void eevdf_kick_preempt_if_needed(struct task_struct *p,
     if (last_kick)
         *last_kick = now_ns;
 
-    u64 flags = scx_bpf_test_and_clear_cpu_idle(cpu) ? SCX_KICK_IDLE : SCX_KICK_PREEMPT;
-    scx_bpf_kick_cpu(cpu, flags);
+    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 }
 
 static bool less_ready(struct bpf_rb_node *a, const struct bpf_rb_node *b)
@@ -557,19 +555,17 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         if (!run_local) {
             // Remote dispatch
             u64 dsq_id = SCX_DSQ_LOCAL_ON | target_cpu;
+            u64 V_now;
 
             bpf_spin_lock(&sctx->lock);
             sctx->avg_vruntime_sum -= key_val;
             sctx->avg_load -= w_val;
             sctx->V = eevdf_calc_V(sctx);
+            V_now = sctx->V;
             bpf_spin_unlock(&sctx->lock);
 
             scx_bpf_dispatch(p, dsq_id, slice, 0);
-            u64 idle = scx_bpf_test_and_clear_cpu_idle(target_cpu);
-            if (idle)
-                scx_bpf_kick_cpu(target_cpu, SCX_KICK_IDLE);
-            else
-                eevdf_kick_preempt_if_needed(p, ve, vd, (u64)-1);
+            eevdf_kick_preempt_if_needed(p, ve, vd, V_now);
 
             bpf_task_release(p);
             bpf_obj_drop(n);
