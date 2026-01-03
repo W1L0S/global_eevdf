@@ -12,14 +12,8 @@
 #define LAG_CLAMP_NS    (BASE_SLICE_NS * 3ULL)  /* Lag clamped to ±3 * base_slice */
 #define MAX_CPUS        256
 
-/*
- * [关键调整]
- * 限制循环次数以避免 NOHZ tick-stop 错误。
- * 增加到 4 次以确保在高负载下 future -> ready 转移能及时完成。
- * 同时避免 BPF 运行过长导致 softirq 积压。
- */
 #define MAX_DISPATCH_LOOPS 4
-#define MAX_PEEK_LOOPS     4
+#define MAX_PEEK_LOOPS     8
 
 #include "../../tools/sched_ext/include/scx/common.bpf.h"
 
