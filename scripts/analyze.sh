@@ -34,8 +34,8 @@ echo "  上下文切换总数: $TOTAL_SWITCHES"
 echo "  任务唤醒次数: $TOTAL_WAKEUPS"
 echo ""
 
-# 时间片轮转分析
-echo "[2] 时间片轮转分析"
+# 可运行态切出分析（prev_state=R）
+echo "[2] 可运行态切出分析（prev_state=R）"
 echo "---"
 
 # 统计不同prev_state的数量
@@ -47,7 +47,7 @@ Z_COUNT=$(grep "sched_switch.*stress-ng" "$TRACE_FILE" | grep "prev_comm=stress-
 TOTAL_STRESS_SWITCHES=$((R_COUNT + D_COUNT + S_COUNT + Z_COUNT))
 
 echo "  stress-ng 状态切换统计:"
-echo "    R状态（时间片用完）: $R_COUNT 次"
+echo "    R状态（可运行态切出：包含抢占/时间片到/主动让出等）: $R_COUNT 次"
 echo "    D状态（I/O等待）: $D_COUNT 次"
 echo "    S状态（主动睡眠）: $S_COUNT 次"
 echo "    Z状态（僵尸）: $Z_COUNT 次"
@@ -55,15 +55,15 @@ echo "    Z状态（僵尸）: $Z_COUNT 次"
 if [ $TOTAL_STRESS_SWITCHES -gt 0 ]; then
     if command -v bc >/dev/null 2>&1; then
         RATIO=$(echo "scale=1; $R_COUNT * 100 / $TOTAL_STRESS_SWITCHES" | bc)
-        echo "    时间片用完的占比: ${RATIO}%"
+        echo "    R状态占比: ${RATIO}%"
     fi
 fi
 
 echo ""
 if [ $R_COUNT -gt 0 ]; then
-    echo "  ✓ 时间片轮转机制工作正常！"
+    echo "  ✓ 存在可运行态切出（包含抢占/时间片到/主动让出）"
 else
-    echo "  ⚠ 未发现因时间片用完被切换的任务"
+    echo "  ⚠ 未发现 prev_state=R 的切出事件"
 fi
 echo ""
 

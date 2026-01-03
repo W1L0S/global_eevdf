@@ -36,12 +36,12 @@ sudo ./scripts/test.sh
 sudo ./scripts/test_perfetto.sh
 ```
 
-**分析结果**：
+**分析**：
 ```bash
 ./scripts/analyze.sh output/scheduler_trace.txt
 ```
 
-分析脚本会输出“唤醒到运行延迟（近似）”指标，用于观察 I/O 唤醒响应。
+分析脚本会输出“唤醒到运行延迟（近似）”指标，用于观察 I/O 唤醒响应；同时会统计 `prev_state=R` 的占比（这是“可运行态切出”占比，包含抢占/时间片到/让出等，不等同于纯粹的时间片用完）。
 
 所有输出文件位于 `output/` 目录。
 
