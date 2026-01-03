@@ -53,7 +53,7 @@ sudo ./scripts/test_perfetto.sh
 - ✅ **双红黑树设计**：合格/不合格树分离，高效任务选择
 - ✅ **防饥饿保证**：lag clamp 机制确保公平性
 
-详细算法说明见 [ARCHITECTURE.md](ARCHITECTURE.md)
+详细算法说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
 
@@ -145,7 +145,8 @@ my-eevdf-scheduler/
 ├── output/                  # 输出文件目录
 │   ├── scheduler_trace.txt  # Ftrace 输出
 │   └── eevdf_trace.perfetto-trace  # Perfetto 输出
-├── ARCHITECTURE.md          # 详细架构文档
+├── docs/
+│   └── ARCHITECTURE.md      # 详细架构文档
 ├── README.md                # 本文档
 └── Makefile                 # 编译配置
 ```

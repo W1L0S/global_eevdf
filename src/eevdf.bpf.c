@@ -436,7 +436,7 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         n = container_of(node, struct eevdf_node, node);
         // 严格判断eligible
         if (n->ve > sctx->V) break;
-
+        
         node = bpf_rbtree_remove(&sctx->future, node);
         if (!node) break;
         bpf_rbtree_add(&sctx->ready, node, less_ready);

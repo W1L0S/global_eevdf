@@ -1,8 +1,10 @@
 #!/bin/bash
-# EEVDF Lag 补偿机制 - 代码验证脚本
+# EEVDF (sched_ext) - 实现一致性验证脚本（与当前代码对齐）
+
+set -e
 
 echo "========================================="
-echo "EEVDF Lag 补偿机制 - 代码验证"
+echo "EEVDF 调度器实现一致性验证"
 echo "========================================="
 echo ""
 
@@ -10,51 +12,49 @@ echo "1. 检查编译产物..."
 if [ -f "build/eevdf.bpf.o" ]; then
     echo "   ✓ BPF 对象: build/eevdf.bpf.o ($(stat -c%s build/eevdf.bpf.o) bytes)"
 else
-    echo "   ✗ 缺少 BPF 对象"
+    echo "   ✗ 缺少 BPF 对象 (build/eevdf.bpf.o)"
     exit 1
 fi
 
 if [ -f "build/loader" ]; then
     echo "   ✓ Loader: build/loader ($(stat -c%s build/loader) bytes)"
 else
-    echo "   ✗ 缺少 Loader"
+    echo "   ✗ 缺少 Loader (build/loader)"
     exit 1
 fi
 
 echo ""
-echo "2. 验证关键常量定义..."
-grep -q "LAG_CLAMP_NS" src/eevdf.bpf.c && echo "   ✓ LAG_CLAMP_NS 已定义" || echo "   ✗ 缺少 LAG_CLAMP_NS"
-grep -q "BASE_SLICE_NS \* 3ULL" src/eevdf.bpf.c && echo "   ✓ Clamp 为 3 倍 base_slice" || echo "   ✗ Clamp 配置错误"
+echo "2. 验证关键常量/参数定义..."
+grep -q "#define BASE_SLICE_NS" src/eevdf.bpf.c && echo "   ✓ BASE_SLICE_NS 已定义" || echo "   ✗ 缺少 BASE_SLICE_NS"
+grep -q "#define MIN_SLICE_NS" src/eevdf.bpf.c && echo "   ✓ MIN_SLICE_NS 已定义" || echo "   ✗ 缺少 MIN_SLICE_NS"
+grep -q "#define MAX_RT_PRIO" src/eevdf.bpf.c && echo "   ✓ MAX_RT_PRIO 已定义" || echo "   ✗ 缺少 MAX_RT_PRIO"
 
 echo ""
-echo "3. 验证辅助函数..."
-grep -q "eevdf_lag_div_weight" src/eevdf.bpf.c && echo "   ✓ eevdf_lag_div_weight 函数存在" || echo "   ✗ 缺少 lag/weight 计算函数"
-grep -q "inv_weight = ((u64)1 << 32) / total_weight" src/eevdf.bpf.c && echo "   ✓ 使用乘倒数计算" || echo "   ✗ 未使用乘倒数"
+echo "3. 验证 V 的加权平均计算路径（eevdf_calc_V）..."
+grep -q "static __always_inline u64 eevdf_calc_V" src/eevdf.bpf.c && echo "   ✓ eevdf_calc_V 函数存在" || echo "   ✗ 缺少 eevdf_calc_V"
+grep -q "avg_vruntime_sum \+ sctx->run_avg_vruntime_sum" src/eevdf.bpf.c && echo "   ✓ V 使用 avg_* + run_avg_*" || echo "   ✗ V 未按等待+运行合并统计"
+grep -q "avg_load \+ sctx->run_avg_load" src/eevdf.bpf.c && echo "   ✓ V 使用 avg_load + run_avg_load" || echo "   ✗ V 未按等待+运行合并负载"
 
 echo ""
-echo "4. 验证 EEVDF 公式实现..."
-grep -q "公式 (4)" src/eevdf.bpf.c && echo "   ✓ 公式 (4): Client 离开竞争" || echo "   ✗ 缺少公式 (4)"
-grep -q "公式 (5)" src/eevdf.bpf.c && echo "   ✓ 公式 (5): Client 加入竞争" || echo "   ✗ 缺少公式 (5)"
-grep -q "公式 (6)" src/eevdf.bpf.c && echo "   ✓ 公式 (6): 权重变更" || echo "   ✗ 缺少公式 (6)"
+echo "4. 验证 per-task 上下文字段（vlag/vruntime/last_weight）..."
+grep -q "s64 vlag;" src/eevdf.bpf.c && echo "   ✓ task_ctx.vlag 存在" || echo "   ✗ 缺少 task_ctx.vlag"
+grep -q "u64 vruntime;" src/eevdf.bpf.c && echo "   ✓ task_ctx.vruntime 存在" || echo "   ✗ 缺少 task_ctx.vruntime"
+grep -q "u64 last_weight;" src/eevdf.bpf.c && echo "   ✓ task_ctx.last_weight 存在" || echo "   ✗ 缺少 task_ctx.last_weight"
 
 echo ""
-echo "5. 验证 task_ctx 结构..."
-grep -q "s64 lag;" src/eevdf.bpf.c && echo "   ✓ task_ctx 包含 lag 字段" || echo "   ✗ task_ctx 缺少 lag 字段"
-grep -q "u64 last_weight;" src/eevdf.bpf.c && echo "   ✓ task_ctx 包含 last_weight 字段" || echo "   ✗ task_ctx 缺少 last_weight"
+echo "5. 验证 vlag 保存/恢复（stopping/enqueue）..."
+grep -q "tctx->vlag = (s64)(sctx->V - tctx->vruntime);" src/eevdf.bpf.c && echo "   ✓ stopping 保存 vlag = V - vruntime" || echo "   ✗ stopping 未保存 vlag"
+grep -q "vruntime_new = V_new - vlag" src/eevdf.bpf.c && echo "   ✓ enqueue 使用 vlag 恢复逻辑（文本说明）" || echo "   ⚠ enqueue 未找到恢复逻辑说明文字（不影响功能）"
 
 echo ""
-echo "6. 验证权重变更检测..."
-grep -q "weight_changed" src/eevdf.bpf.c && echo "   ✓ 实现权重变更检测" || echo "   ✗ 缺少权重变更检测"
+echo "6. 验证 eligible 判定与双红黑树排序..."
+grep -q "if (n->ve <= sctx->V)" src/eevdf.bpf.c && echo "   ✓ eligible 判定 (ve <= V) 存在" || echo "   ✗ 缺少 eligible 判定"
+grep -q "if (na->vd == nb->vd) return na->pid < nb->pid;" src/eevdf.bpf.c && echo "   ✓ ready: vd 相等时 pid tiebreaker" || echo "   ✗ ready tiebreaker 缺失"
+grep -q "if (na->ve == nb->ve) return na->pid < nb->pid;" src/eevdf.bpf.c && echo "   ✓ future: ve 相等时 pid tiebreaker" || echo "   ✗ future tiebreaker 缺失"
 
 echo ""
-echo "7. 统计 eevdf_lag_div_weight 使用次数..."
-LAG_DIV_COUNT=$(grep -c "eevdf_lag_div_weight" src/eevdf.bpf.c)
-echo "   使用次数: $LAG_DIV_COUNT 次"
-if [ "$LAG_DIV_COUNT" -ge 4 ]; then
-    echo "   ✓ 在关键位置使用乘倒数计算"
-else
-    echo "   ✗ 使用次数不足"
-fi
+echo "7. 验证时间片策略（当前为固定 3ms）..."
+grep -q "return 3000000ULL;" src/eevdf.bpf.c && echo "   ✓ eevdf_calculate_slice: 固定 3000000ns" || echo "   ⚠ 未找到固定 3ms（可能已改为动态算法）"
 
 echo ""
 echo "8. 检查系统 sched_ext 支持..."
@@ -68,16 +68,14 @@ fi
 
 echo ""
 echo "========================================="
-echo "验证完成！"
+echo "验证完成"
 echo "========================================="
 echo ""
-echo "所有核心功能已实现："
-echo "  ✓ Lag 保存和恢复机制"
-echo "  ✓ 3 倍 base_slice 的 lag clamp"
-echo "  ✓ 乘倒数计算 (避免有符号除法)"
-echo "  ✓ EEVDF 公式 (4), (5), (6) 实现"
-echo "  ✓ 权重变更自动处理"
+echo "当前实现的关键特性（以代码为准）："
+echo "  ✓ V 通过等待+运行任务的加权平均重算 (eevdf_calc_V)"
+echo "  ✓ vlag = V - vruntime 保存/恢复（用于唤醒补偿）"
+echo "  ✓ ready/future 双红黑树与 ve<=V eligible 判定"
+echo "  ✓ 固定 3ms 时间片（如需动态时间片可在 eevdf_calculate_slice 扩展）"
 echo ""
-echo "要运行实际测试（需要 root 权限）："
+echo "要运行功能测试（需要 root 权限）："
 echo "  sudo bash scripts/test.sh --cpu-only --duration 10"
-echo "========================================="

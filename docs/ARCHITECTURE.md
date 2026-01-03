@@ -64,7 +64,7 @@ struct eevdf_node {
 ```c
 struct task_ctx {
     u64 vruntime;       // 任务的虚拟运行时间
-    s64 lag;            // 保存的 lag (vruntime - V)，用于补偿计算
+    s64 vlag;           // vlag = V - vruntime（正值=落后，负值=超前）
     u64 last_run_ns;    // 上次开始运行的时间戳
     u64 saved_vd;       // 保存的虚拟截止时间
     u64 last_weight;    // 上次计算的权重（用于检测权重变更）
@@ -72,140 +72,43 @@ struct task_ctx {
 };
 ```
 
-**Lag 字段作用**：
-- 在任务 dequeue 时保存 `lag = vruntime - V`
-- 在任务 enqueue 时恢复，提供延迟补偿
-- 防止长时间睡眠的交互式任务失去公平份额
+**vlag 字段作用**：
+- 在任务 stopping 时保存 `vlag = V - vruntime`
+- 在任务 enqueue 时按 `vruntime = V - vlag` 恢复（并做上/下限裁剪）
+- 让长时间睡眠/交互任务恢复时不至于“丢份额”
 
 ---
 
-### 2. Lag 补偿机制
+### 2. vlag 保存/恢复（唤醒补偿）
 
-Lag 补偿机制是 EEVDF 算法的核心特性，确保任务的公平性和交互式任务的响应性。
+当前实现使用 `vlag = V - vruntime` 做“唤醒补偿”的跨睡眠状态保存/恢复；同时用 `eevdf_calc_V()` 统一重算系统虚拟时间 `V`（而不是在 BPF 中直接做 `lag/Σw` 的显式更新）。
 
-#### 2.1 Lag 定义
-
-```
-lag = vruntime - V
-```
-
-- **lag < 0**：任务落后于系统平均进度，应获得补偿（更高优先级）
-- **lag > 0**：任务超前于系统平均进度，应降低优先级
-- **lag = 0**：任务与系统虚拟时间完全同步
-
-#### 2.2 EEVDF 公式 (4): 任务离开竞争
+#### 2.1 vlag 定义
 
 ```
-V(t) = V(t) + lag_j(t) / Σw_i
+vlag = V - vruntime
 ```
 
-**实现位置**：`stopping` 回调 (src/eevdf.bpf.c:622-644)
+- **vlag > 0**：任务落后于系统平均（应该给予一定补偿）
+- **vlag < 0**：任务超前于系统平均（应该给予一定惩罚）
+- **vlag = 0**：任务与系统虚拟时间同步
 
-**逻辑流程**：
-1. 计算 `lag = tctx->vruntime - sctx->V`
-2. 保存 lag 到 `tctx->lag`（在 enqueue 时使用）
-3. 使用 `eevdf_lag_div_weight(lag, total_weight)` 计算 V 的增量
-4. 更新 `V += lag / total_weight`
+#### 2.2 保存位置（stopping）
 
-**物理意义**：任务离开时，其 lag 被分摊到剩余任务中，调整系统虚拟时间。
+- stopping 中先基于运行时长更新 `vruntime`，再把该任务从 `run_avg_*` 统计移除并调用 `eevdf_calc_V()` 重算 `V`
+- 随后保存 `tctx->vlag = V - vruntime`，供下次 enqueue 恢复
 
-#### 2.3 EEVDF 公式 (5): 任务加入竞争
+#### 2.3 恢复位置（enqueue）
 
-```
-V(t) = V(t) - lag_j(t) / (Σw_i + w_j)
-```
+- enqueue 中按内核风格公式恢复：`vruntime = V - vlag`
+- 为避免极端补偿/惩罚，当前实现做了基于 `slice_ns` 的裁剪：
+  - 最大补偿：`vlag <= slice_ns`
+  - 最大惩罚：`vlag >= -(slice_ns/2)`
 
-**实现位置**：`enqueue` 回调，权重未变更时 (src/eevdf.bpf.c:353-365)
+#### 2.4 Clamp 与数值稳定性
 
-**逻辑流程**：
-1. 读取保存的 `lag = tctx->lag`
-2. Clamp lag 到 `±3 * base_slice`
-3. 使用 `eevdf_lag_div_weight(lag, total_weight + weight)` 计算 V 的减量
-4. 更新 `V -= lag / (total_weight + weight)`
-5. 恢复 `vruntime = V + clamped_lag`
-
-**物理意义**：任务加入时，其 lag 被反向应用到系统虚拟时间，落后的任务（负 lag）会提升 V，从而获得更高优先级。
-
-#### 2.4 EEVDF 公式 (6): 权重变更
-
-```
-V(t) = V(t) + lag_j/(Σw_i - w_j) - lag_j/(Σw_i - w_j + w_j')
-```
-
-简化为：
-```
-V(t) = V(t) + lag_j/Σw_i - lag_j/(Σw_i + w_j')
-```
-
-**实现位置**：`enqueue` 回调，检测到权重变更时 (src/eevdf.bpf.c:331-352)
-
-**逻辑流程**：
-1. 检测 `old_weight != new_weight`
-2. **第一项**：`V += lag / total_weight`（模拟以旧权重离开）
-3. **第二项**：`V -= lag / (total_weight + new_weight)`（模拟以新权重加入）
-
-**物理意义**：权重变更等价于任务以旧权重离开后以新权重重新加入，平滑调整虚拟时间。
-
-**触发场景**：
-- Nice 值变化
-- Cgroup 权重调整
-- 优先级动态调整
-
-#### 2.5 Lag Clamp
-
-**配置**：
-```c
-#define LAG_CLAMP_NS (BASE_SLICE_NS * 3ULL)  // 默认 9ms
-```
-
-**实现**：
-```c
-static __always_inline s64 eevdf_clamp_lag(s64 lag)
-{
-    s64 limit = (s64)LAG_CLAMP_NS;
-    if (lag > limit) return limit;
-    if (lag < -limit) return -limit;
-    return lag;
-}
-```
-
-**作用**：
-- 限制 lag 到 `±3 * base_slice` 范围
-- 防止极端 lag 值破坏调度公平性
-- 平衡交互式任务的响应性和 CPU 密集型任务的公平性
-- **符合 Linux 内核默认配置**
-
-**调优建议**：
-- 移动端/桌面场景：可使用 3-5 倍（更好的交互性）
-- 服务器场景：可使用 1-2 倍（更严格的公平性）
-
-#### 2.6 乘倒数优化
-
-BPF 不支持有符号除法，使用乘倒数替代 `lag / weight` 计算：
-
-```c
-static __always_inline u64 eevdf_lag_div_weight(s64 lag, u64 total_weight)
-{
-    if (total_weight == 0) return 0;
-
-    // 计算权重倒数: inv_weight = (1ULL << 32) / total_weight
-    u64 inv_weight = ((u64)1 << 32) / total_weight;
-
-    // 获取 lag 的绝对值
-    u64 abs_lag = lag < 0 ? (u64)(-lag) : (u64)lag;
-
-    // delta = (abs_lag * inv_weight) >> 32
-    u64 delta = (abs_lag * inv_weight) >> 32;
-
-    return delta;
-}
-```
-
-**优势**：
-- 避免 BPF 不支持的有符号除法
-- 使用移位操作提高效率
-- **更接近 Linux 内核实现方式**
-- 保持数值精度（32位定点数）
+- `LAG_CLAMP_NS` 仍用于虚拟时间系统的数值稳定性控制（例如 `base_v` rebasing 的阈值）
+- `eevdf_clamp_lag()` / `eevdf_lag_div_weight()` 作为工具函数保留，但当前主路径以 `eevdf_calc_V()` 为准
 
 ---
 
@@ -270,7 +173,7 @@ while (loops < MAX_DISPATCH_LOOPS) {
 }
 ```
 
-**限制**：最多转移 8 个节点，防止持锁时间过长
+**限制**：最多转移 4 个节点，防止持锁时间过长
 
 **性能考量**：
 - 在 `enqueue` 中：转移 + 插入
@@ -299,7 +202,7 @@ V = base_v + (avg_vruntime_sum + run_avg_vruntime_sum) / (avg_load + run_avg_loa
 **作用**：
 1. 决定任务是否合格（`ve ≤ V` → 合格）
 2. 新任务初始化时，`vruntime` 从 V 开始，确保公平
-3. **Lag 补偿的参照点**：`lag = vruntime - V`
+3. 唤醒补偿的参照点：`vlag = V - vruntime`
 
 #### 4.2 任务虚拟运行时间 (vruntime)
 
@@ -339,53 +242,37 @@ run_avg_vruntime_sum -= delta * run_avg_load
 #### 5.1 任务入队 (`enqueue`)
 
 ```
-新任务到达
+任务入队
     ↓
-计算权重 (weight, wmult)
+分配 eevdf_node / 获取 task_ctx
     ↓
-计算时间片 (slice_ns)
+计算 weight, wmult（含 cgroup weight 修正）
     ↓
-计算虚拟时间片 (vslice)
+slice_ns = eevdf_calculate_slice()（当前固定 3ms）
+vslice = (slice_ns * NICE_0_LOAD * wmult) >> 32
     ↓
-读取保存的 lag
+恢复 vruntime（得到 ve）
+    - 首次启用/首个任务：初始化 V/base_v/统计
+    - 新任务：vruntime = V，vlag = 0
+    - 旧任务：vruntime = V - vlag（vlag 做基于 slice_ns 的裁剪）
     ↓
-检测权重变更?
-    ├─yes→ 应用公式 (6)
-    │      V += lag/Σw_i
-    │      V -= lag/(Σw_i + w_new)
-    │
-    └─no→ 应用公式 (5)
-           V -= lag/(Σw_i + w_new)
+vd = ve + vslice
     ↓
-Clamp lag 到 ±3*base_slice
+加入 avg_* 统计并重算 V（eevdf_calc_V）
     ↓
-恢复 vruntime = V + lag
+将 future 中 ve <= V_old 的节点搬到 ready（最多 4 个）
     ↓
-设置 ve = vruntime
-设置 vd = ve + vslice
-    ↓
-加入统计 (avg_vruntime_sum, avg_load)
-    ↓
-更新系统虚拟时间 V
-    ↓
-转移 future→ready（最多8个）
-    ↓
-ve ≤ V? ───yes→ 插入 ready 树
-    │
-   no
-    ↓
-插入 future 树
+ve <= V ? → ready : future
 ```
 
 **关键点**：
-- 新任务的 vruntime 从系统 V 开始（如果为0）
-- **Lag 补偿在这里生效**，落后任务获得更高优先级
-- 权重变更自动检测和处理
+- eligible 判定严格使用 `ve <= V`
+- 当前实现以 `eevdf_calc_V()` 统一重算 V，而非显式执行“公式(4)(5)(6)”路径
 
 #### 5.2 任务调度 (`dispatch`)
 
 ```
-转移 future→ready（最多8个）
+转移 future→ready（最多4个）
     ↓
 循环查找（最多8次）
     ↓
@@ -416,85 +303,51 @@ ve ≤ V? ───yes→ 插入 ready 树
 ```
 任务停止运行
     ↓
-更新 vruntime
+基于 last_run_ns 更新 vruntime（delta_v）
     ↓
-从 run_avg_* 统计中移除
+从 run_avg_* 统计中移除并重算 V（eevdf_calc_V）
     ↓
-计算 lag = vruntime - V（公式 4）
+保存 vlag = V - vruntime
     ↓
-保存 lag 到 task_ctx
-    ↓
-更新 V: V += lag / Σw_i
-    ↓
-更新系统虚拟时间 V
-    ↓
-任务还可运行? ───no→ 完成（进程退出或睡眠）
-    │
-   yes（时间片用完）
-    ↓
-重新计算权重和时间片
-    ↓
-应用公式 (5): V -= lag/(Σw_i + w_new)
-    ↓
-设置 ve = vruntime
-设置 vd = ve + vslice
-    ↓
-加入 avg_* 统计
-    ↓
-ve ≤ V? ───yes→ 重新插入 ready 树
-    │
-   no
-    ↓
-重新插入 future 树
+runnable?
+  ├─no → 完成（睡眠/退出）
+  └─yes（时间片用完）
+        ↓
+        重新计算 weight/wmult 与 slice/vslice
+        ↓
+        ve = vruntime
+        vd = ve + vslice
+        ↓
+        加入 avg_* 统计并重算 V
+        ↓
+        ve <= V ? → ready : future
 ```
 
 **关键点**：
-- `runnable` 参数区分：时间片用完（true）vs 主动睡眠（false）
-- **时间片轮转机制的核心**：任务用完时间片后重新入队
-- **Lag 在这里被保存**，等待下次 enqueue 时使用
-- 不在 stopping 中做树间转移（减少持锁时间）
+- `runnable` 为 true 时负责“时间片轮转”：构造新节点重新入队
+- stopping 中不做 future→ready 转移（减少持锁时间），转移集中在 enqueue/dispatch
 
 ---
 
-### 6. 时间片计算
+### 6. 时间片与权重
 
-#### 6.1 动态时间片算法
+#### 6.1 时间片（当前实现）
 
-```c
-slice_ns = EEVDF_PERIOD_NS / total_load
-slice_ns = (slice_ns * factor) >> 10
-```
+当前实现将物理时间片简化为固定值：
 
-**参数**：
-- `EEVDF_PERIOD_NS = 12ms`：调度周期
-- `total_load`：系统总负载（等待 + 运行）
-- `factor`：基于 latency_nice 的调整因子
+- `slice_ns = 3000000ns`（3ms，见 `eevdf_calculate_slice()`）
 
-**latency_nice 计算**：
-```c
-latency_nice = (static_prio - 120)  // 范围: -20 ~ +19
-factor = 1024 + latency_nice * 64  // 范围: 256 ~ 4096
-```
-
-**边界保护**：
-```c
-if (slice_ns < MIN_SLICE_NS) slice_ns = MIN_SLICE_NS;  // 最小1ms
-```
+调度差异主要通过权重影响“虚拟时间增量”（`delta_v`）与 `vslice` 来体现。
 
 #### 6.2 权重系统
 
-**Nice值到权重的映射**：使用 Linux 内核标准权重表（40个元素）
+- Nice 值到权重：使用内核标准权重表（40个元素）
+- cgroup 权重修正：`effective_weight = base_weight * cg_weight / NICE_0_LOAD`
+- 计算 `wmult`：`wmult = (1<<32) / effective_weight`
 
-**有效权重计算**：
-```c
-effective_weight = (base_weight * cgroup_weight) / NICE_0_LOAD
-wmult = (1 << 32) / effective_weight
-```
-
-**权重用途**：
-1. 虚拟时间增长速度：`delta_v = delta_ns * NICE_0_LOAD * wmult >> 32`
-2. Lag 补偿计算：`V 增量 = lag / total_weight`
-3. 时间片分配：高权重任务可能获得更长时间片
+权重用途：
+1. `delta_v = (delta_ns * NICE_0_LOAD * wmult) >> 32`
+2. `vslice = (slice_ns * NICE_0_LOAD * wmult) >> 32`
 
 ---
 
@@ -510,16 +363,15 @@ wmult = (1 << 32) / effective_weight
 - 即使 `ve > V`（不合格），最终 V 会追上 ve
 - 一旦合格，任务的 deadline 固定，不会被无限推迟
 
-#### 7.2 Lag Clamp 防护
+#### 7.2 vlag 裁剪与数值稳定性
 
 **作用**：
-- 防止长时间睡眠的任务醒来后 lag 过小（负值过大），占用过多 CPU
-- 防止新任务 lag 过大（正值过大），被长期饥饿
-- 限制到 `±3 * base_slice`（默认 ±9ms）
+- 限制唤醒补偿/惩罚幅度：enqueue 中对 `vlag` 做基于 `slice_ns` 的裁剪，避免极端行为
+- 保持数值稳定性：`LAG_CLAMP_NS` 主要用于 `V/base_v` 的数值稳定性控制（例如 rebasing 阈值）
 
 **效果**：
-- 交互式任务：获得适度补偿，提高响应性
-- CPU 密集型任务：保持公平性，防止被饿死
+- 交互式任务：不会因为长时间睡眠而完全失去“相对份额”
+- CPU 密集型任务：不会被一次性过度补偿抢占
 
 #### 7.3 V 基准点重置
 
@@ -541,9 +393,9 @@ wmult = (1 << 32) / effective_weight
 - 系统虚拟时间 V 和 base_v
 
 **持锁时间优化**：
-- `enqueue`：Lag 补偿 + 树间转移 + 插入节点
-- `dispatch`：树间转移 + 取节点（循环最多8次，每次短暂持锁）
-- `stopping`：Lag 保存 + **不做**树间转移，仅直接插入
+- `enqueue`：vlag 恢复 + 树间转移（<=4）+ 插入节点
+- `dispatch`：树间转移（<=4）+ 取节点（查找循环<=8，每次短暂持锁）
+- `stopping`：vlag 保存 + **不做**树间转移，仅直接插入
 
 #### 8.2 CPU 运行账户
 
@@ -568,17 +420,16 @@ struct run_accounting {
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `BASE_SLICE_NS` | 3ms | 基础时间片 |
-| `MIN_SLICE_NS` | 1ms | 最小时间片 |
-| `EEVDF_PERIOD_NS` | 12ms | 调度周期 |
-| `LAG_CLAMP_NS` | 9ms (3x) | Lag clamp 范围 |
-| `MAX_DISPATCH_LOOPS` | 8 | 最大循环次数 |
-| `MAX_PEEK_LOOPS` | 8 | 最大查找次数 |
+| `BASE_SLICE_NS` | 3ms | 基础时间片常量（当前 slice 固定 3ms） |
+| `MIN_SLICE_NS` | 1ms | 最小时间片常量（当前未用于 slice 计算） |
+| `EEVDF_PERIOD_NS` | 12ms | 周期常量（当前未用于 slice 计算） |
+| `LAG_CLAMP_NS` | 9ms (3x) | 数值稳定性阈值相关常量（配合 base_v rebasing） |
+| `MAX_DISPATCH_LOOPS` | 4 | future→ready 转移循环上界 |
+| `MAX_PEEK_LOOPS` | 8 | dispatch 查找循环上界 |
 
 **调优建议**：
-- 移动端场景：可适当增加 `BASE_SLICE_NS`，减少上下文切换
-- 交互式场景：可适当减小 `EEVDF_PERIOD_NS`，提高响应性
-- 服务器场景：可减小 `LAG_CLAMP_NS` 倍数，强化公平性
+- 若要启用动态时间片：在 `eevdf_calculate_slice()` 引入 `EEVDF_PERIOD_NS/MIN_SLICE_NS` 的策略
+- 若要强化/弱化唤醒补偿：调整 enqueue 中 `vlag` 的裁剪范围（当前：补偿<=1个 slice，惩罚<=0.5个 slice）
 
 ---
 
@@ -586,29 +437,24 @@ struct run_accounting {
 
 #### 10.1 与 Linux 内核的一致性
 
-| 特性 | Linux 内核 EEVDF | 本实现 | 实现位置 |
-|------|----------------|--------|---------|
-| Lag 保存/恢复 | ✓ | ✓ | task_ctx.lag |
-| Lag clamp (3x) | ✓ | ✓ | eevdf_clamp_lag() |
-| 公式 (4) - 离开 | ✓ | ✓ | stopping:622-644 |
-| 公式 (5) - 加入 | ✓ | ✓ | enqueue:353-365 |
-| 公式 (6) - 权重变更 | ✓ | ✓ | enqueue:331-352 |
-| 乘倒数计算 | ✓ | ✓ | eevdf_lag_div_weight() |
-| 双红黑树 | ✓ | ✓ | ready + future |
-| 防饥饿机制 | ✓ | ✓ | deadline + lag clamp |
+| 特性 | Linux 内核 EEVDF | 本实现 | 备注 |
+|------|----------------|--------|------|
+| 唤醒补偿状态保存/恢复 | ✓ | ✓ | 使用 `vlag = V - vruntime` 保存/恢复 |
+| Lag clamp (3x base_slice) | ✓ | 部分 | 提供 `LAG_CLAMP_NS/eevdf_clamp_lag()`，主路径当前以 slice 级裁剪为准 |
+| 显式公式 (4)(5)(6) 更新 V | ✓ | ✗ | 本实现通过 `eevdf_calc_V()` 加权平均统一重算 V |
+| 乘倒数工具函数 | ✓ | ✓ | `eevdf_lag_div_weight()` 保留（当前主路径未使用） |
+| 双红黑树 | ✓ | ✓ | ready 按 vd；future 按 ve |
+| 防饥饿机制 | ✓ | ✓ | deadline 机制 + V 追赶 future.ve |
 
 #### 10.2 BPF 特定优化
 
-1. **乘倒数代替除法**：
-   ```c
-   // 避免: delta = lag / total_weight  (BPF 不支持有符号除法)
-   // 使用: delta = (abs_lag * inv_weight) >> 32
-   ```
+1. **避免有符号除法依赖**：主路径通过 `eevdf_calc_V()` 重算 `V`；同时保留 `eevdf_lag_div_weight()` 作为可选工具函数。
 
 2. **循环次数限制**：
    - 防止 BPF verifier 拒绝无界循环
    - 防止持锁时间过长导致 Hard Lockup
-   - 所有循环都有明确上界（8 次）
+   - future→ready 转移循环上界：4 次（MAX_DISPATCH_LOOPS）
+  - dispatch 查找循环上界：8 次（MAX_PEEK_LOOPS）
 
 3. **内存分配**：
    - 使用 `bpf_obj_new/drop` 管理 eevdf_node
@@ -636,13 +482,11 @@ struct run_accounting {
 ```
 my-eevdf-scheduler/
 ├── src/
-│   ├── eevdf.bpf.c       # eBPF 调度器核心（~700行）
-│   │   ├── [12] LAG_CLAMP_NS 定义
-│   │   ├── [65] task_ctx (含 lag 字段)
-│   │   ├── [134-148] eevdf_lag_div_weight()
-│   │   ├── [244-361] enqueue (公式 5, 6)
-│   │   ├── [363-519] dispatch
-│   │   └── [521-643] stopping (公式 4)
+│   ├── eevdf.bpf.c       # eBPF 调度器核心
+│   │   ├── 常量/权重表/辅助函数（含 eevdf_calc_V / eevdf_compute_weight 等）
+│   │   ├── eevdf_enqueue(): 计算 weight/vslice，恢复 vruntime，按 ve<=V 入 ready/future
+│   │   ├── eevdf_dispatch(): future→ready 转移(<=4) + 选择最小 vd + affinity 处理
+│   │   └── eevdf_stopping(): 记账更新 vruntime，保存 vlag，runnable 时重新入队
 │   └── loader.c          # 用户态加载器（80行）
 ├── scripts/
 │   ├── test.sh           # 主测试脚本
@@ -659,19 +503,16 @@ my-eevdf-scheduler/
 
 ## 算法流程图
 
-### Lag 补偿完整流程
+### vlag 保存/恢复流程（唤醒补偿）
 
 ```
 任务运行中
     ↓
-vruntime 增长
+stopping: 记录运行时长 → vruntime 增长（delta_v）
     ↓
-=== STOPPING (runnable=false) ===
+stopping: 从 run_avg_* 移除并 eevdf_calc_V() 重算 V
     ↓
-计算 lag = vruntime - V
-保存到 task_ctx.lag
-    ↓
-V += lag / Σw_i  (公式 4)
+stopping: 保存 vlag = V - vruntime
     ↓
 任务进入睡眠状态
     ↓
@@ -679,64 +520,35 @@ V += lag / Σw_i  (公式 4)
     ↓
 任务被唤醒
     ↓
-=== ENQUEUE ===
+enqueue: 读取 vlag
     ↓
-读取 task_ctx.lag
+enqueue: 裁剪 vlag（补偿<=1个 slice，惩罚<=0.5个 slice）
     ↓
-权重变更? ──yes→ V += lag/Σw_i  (公式 6 第一项)
-    │              V -= lag/(Σw_i + w_new)  (公式 6 第二项)
-    │
-   no
-    ↓
-V -= lag / (Σw_i + w_new)  (公式 5)
-    ↓
-Clamp lag 到 ±3*base_slice
-    ↓
-vruntime = V + clamped_lag
+enqueue: 恢复 vruntime = V - vlag
     ↓
 ve = vruntime
 vd = ve + vslice
     ↓
-插入 ready/future 树
+插入 ready/future（以 ve<=V 判断 eligible）
     ↓
-=== DISPATCH ===
-    ↓
-选择最早 deadline 的任务
-    ↓
-任务开始运行
+dispatch: 优先选择 ready 中最小 vd 的任务运行
 ```
 
 ---
 
 ## 总结
 
-本 EEVDF 调度器实现了一个**完整、规范、高效**的调度系统：
+本 EEVDF 调度器实现了一个以 `ready/future` 双红黑树为核心的数据结构，并通过 `eevdf_calc_V()` 维护系统虚拟时间 `V` 的 sched_ext 调度器。
 
-### 核心成就
+### 核心特性
 
-- ✅ **完整的 EEVDF 算法**：实现论文中的所有核心公式
-- ✅ **Lag 补偿机制**：符合 Linux 内核规范的 lag 保存/恢复/clamp
-- ✅ **权重动态变更**：自动检测并处理权重变化（公式 6）
-- ✅ **双红黑树设计**：合格/不合格树分离，高效选择
-- ✅ **乘倒数优化**：BPF 友好的高效计算方式
-- ✅ **防饥饿机制**：deadline 调度 + lag clamp 双重保证
-- ✅ **并发优化**：限制循环次数，减少持锁时间
+- ✅ **双红黑树设计**：ready（按 vd）+ future（按 ve），严格以 `ve<=V` 判断 eligible
+- ✅ **vlag 保存/恢复**：使用 `vlag = V - vruntime` 在睡眠/唤醒之间提供适度补偿
+- ✅ **V 加权平均重算**：等待+运行统一统计，周期性通过 `eevdf_calc_V()` 重算 `V`
+- ✅ **防饥饿机制**：deadline 机制 + ready 为空时推进 `V` 追赶 future.ve
+- ✅ **BPF 约束友好**：所有循环有明确上界（转移<=4，查找<=8），持锁时间受控
 
-### 验证结果
+### 验证与测试
 
-**代码验证**（运行 `scripts/verify_implementation.sh`）：
-- ✓ LAG_CLAMP_NS 配置正确（3倍 base_slice）
-- ✓ eevdf_lag_div_weight 函数实现完整
-- ✓ EEVDF 公式 (4), (5), (6) 全部实现
-- ✓ task_ctx 包含 lag 和 last_weight 字段
-- ✓ 权重变更检测机制工作正常
-
-**功能测试**（基于 ftrace）：
-- ✓ 时间片轮转工作正常（25.8%的切换因时间片用完）
-- ✓ 多 CPU 负载均衡良好
-- ✓ 无任务饥饿现象
-- ✓ 通过 stress-ng CPU 压力测试
-
-### 与内核对比
-
-本实现在 lag 补偿、权重变更处理、虚拟时间管理等核心机制上完全符合 Linux 内核 EEVDF 规范，同时针对 BPF 环境进行了优化（乘倒数、循环限制等）。
+- 代码一致性验证：运行 `scripts/verify_implementation.sh`（已与当前实现对齐）
+- 行为测试：运行 `scripts/test.sh` 或 `scripts/test_perfetto.sh` 采集 trace 做分析
