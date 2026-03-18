@@ -1,84 +1,76 @@
-# EEVDF 调度器（sched_ext）
+# Global EEVDF Scheduler
 
-基于 Linux 6.12+ 的 sched_ext 框架，实现 EEVDF (Earliest Eligible Virtual Deadline First) 调度器的 eBPF 版本，包含唤醒补偿（vlag）与唤醒抢占（带粒度/限频）。
+基于 Linux `sched_ext` (eBPF) 的全局 EEVDF 调度器实现。
 
-算法与实现细节见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+项目目标是把 EEVDF 的核心语义在 BPF 环境里落地：
+
+- eligible 判定：$ve \le V$
+- 虚拟截止时间优先：最小 `vd` 先运行
+- lag 保存与恢复：$vlag = V - vruntime$
+
+## 项目做了什么
+
+1. 用两棵全局红黑树管理任务。
+2. 用加权统计实时推进系统虚拟时间 $V$。
+3. 保留任务 `vlag`，保证睡眠/唤醒后的公平恢复。
+4. 支持本地派发和跨 CPU 远程派发。
+
+对应队列含义：
+
+- `ready`：满足 $ve \le V$，可直接参与调度。
+- `future`：暂不满足 eligible，等待 $V$ 推进后转入 `ready`。
+
+## 代码结构
+
+- `src/global_eevdf.bpf.c`：调度核心（enqueue、dispatch、stopping、抢占触发）。
+- `src/loader.c`：用户态加载器，负责 open/load/attach/detach。
+- `include/`：头文件和 `vmlinux.h`。
+- `tests/`：BPF 与 kfunc 相关测试代码。
+- `scripts/`：验证、压测、跟踪脚本。
+- `docs/ARCHITECTURE.md`：完整架构说明与关键公式。
+
+## 环境要求
+
+- Linux 内核支持 `sched_ext`（建议 6.12+，并启用 `CONFIG_SCHED_CLASS_EXT=y`）。
+- `clang-17+`、`bpftool`、`libbpf` 相关开发依赖。
+- 需要 root 权限加载调度器。
 
 ## 快速开始
 
-### 0) 依赖与前置条件
-
-- Linux 6.12+ 且启用 `CONFIG_SCHED_CLASS_EXT`
-- clang/LLVM、gcc、libelf、zlib、libbpf（来自你的内核源码树）
-- stress-ng（用于压测）
-
-注意：默认 Makefile 将 `KERNEL_SRC` 指向本机内核源码路径，必要时先修改 [Makefile](Makefile) 的 `KERNEL_SRC`。
-
-### 1) 编译
-
 ```bash
+# 1) 生成 vmlinux.h
+make install-vmlinux
+
+# 2) 编译
 make
+
+# 3) 运行调度器（前台）
+sudo ./build/loader_global_eevdf
 ```
 
-### 2) 运行
-
-```bash
-sudo ./build/loader
-```
-
-停止：按 `Ctrl+C`
-
-### 3) 一键测试
-
-Ftrace（文本 trace，快速验证）：
-
-```bash
-sudo ./scripts/test.sh --cpu-only --duration 10
-sudo ./scripts/test.sh --mixed --duration 10
-sudo ./scripts/test.sh --io-only --duration 10
-```
-
-输出：`output/scheduler_trace.txt`，分析：
-
-```bash
-./scripts/analyze.sh output/scheduler_trace.txt
-```
-
-Perfetto（可视化，推荐；使用 tracebox 采集）：
-
-```bash
-./scripts/setup_perfetto.sh
-sudo ./scripts/test_perfetto.sh --io-only --duration 10
-```
-
-输出：`output/eevdf_trace.perfetto-trace`，打开 https://ui.perfetto.dev 上传查看。
-
-## 目录结构
-
-```
-my-eevdf-scheduler/
-├── src/                       # eBPF 与用户态 loader
-├── scripts/                   # 测试/分析/清理脚本
-├── configs/perfetto_config.pbtx
-├── tools/perfetto/            # perfetto/tracebox 等工具
-├── build/                     # 编译产物
-└── output/                    # trace 输出
-```
+停止方式：`Ctrl+C`。
 
 ## 常用命令
 
 ```bash
-cat /sys/kernel/sched_ext/state
-sudo dmesg | tail -20
-sudo ./scripts/cleanup.sh
-./scripts/verify_implementation.sh
+# 编译测试程序
+make test
+
+# 构建 kfunc 测试
+make test-kfuncs
+
+# 执行基础验证脚本
+make test-verify
 ```
 
-## 常见问题
+## 调度流程速览
 
-- 调度器未启用：检查 `/sys/kernel/sched_ext/state` 与内核配置。
-- Perfetto trace 无法打开：通常是权限问题，脚本会尝试修复；也可手动 `chown/chmod output/eevdf_trace.perfetto-trace`。
+1. 任务入队时计算 `weight/wmult`、`ve/vd`，并按 $ve \le V$ 入 `ready/future`。
+2. CPU 需要任务时，从 `ready` 取最小 `vd`；必要时先把 `future` 中已 eligible 的任务搬到 `ready`。
+3. 任务停机时结算 `vruntime`，保存 `vlag`，若仍 runnable 则重新入队。
 
-## 许可证
+## 文档入口
 
-GPL v2
+- 架构与公式：`docs/ARCHITECTURE.md`
+- 基准与分析脚本：`scripts/`
+- 输出示例：`output/`

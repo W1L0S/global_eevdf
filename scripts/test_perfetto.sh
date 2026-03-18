@@ -1,7 +1,6 @@
 #!/bin/bash
-# EEVDF 调度器 Perfetto 测试脚本
+# Global EEVDF 调度器 Perfetto 测试脚本
 # 使用 Perfetto 捕获高质量的调度器 trace
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +94,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --io-only        测试 I/O 密集型负载（频繁睡眠/唤醒）"
             echo "  --duration N     测试时长（秒，默认10）"
             echo "  -h, --help       显示此帮助信息"
+            echo ""
+            echo "示例:"
+            echo "  sudo $0 --cpu-only --duration 10"
+            echo "  sudo $0 --mixed --duration 15"
+            echo "  sudo $0 --io-only --duration 20"
             exit 0
             ;;
         *)
@@ -105,9 +109,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+LOADER_BIN="./build/loader_global_eevdf"
+SCHED_NAME="global_eevdf"
+
 echo "========================================"
-echo "EEVDF 调度器 Perfetto 测试"
+echo "Global EEVDF 调度器 Perfetto 测试"
 echo "========================================"
+echo "调度器: $SCHED_NAME"
 echo "测试模式: $TEST_MODE"
 echo "测试时长: ${DURATION}秒"
 echo ""
@@ -132,6 +140,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
+# 检查 loader
+if [ ! -x "$LOADER_BIN" ]; then
+    echo "错误：未找到 $LOADER_BIN"
+    echo "请先运行: make $BPF_VERSION"
+    exit 1
+fi
+
 # 清理旧文件
 rm -f "$TRACE_FILE"
 
@@ -142,14 +157,11 @@ TEMP_CONFIG="$(mktemp -p "$PROJECT_ROOT" .perfetto_config.XXXXXX.pbtx)"
 # 复制配置文件并替换持续时间
 sed "0,/duration_ms: [0-9]*/s//duration_ms: $DURATION_MS/" "$CONFIG_FILE" > "$TEMP_CONFIG"
 
-echo "[1/5] 启动 EEVDF 调度器..."
-if [ ! -x "./build/loader" ]; then
-    echo "错误：未找到 ./build/loader，请先运行 make"
-    exit 1
-fi
-./build/loader &
+echo "[1/5] 启动 EEVDF 调度器 ($BPF_VERSION)..."
+$LOADER_BIN &
 LOADER_PID=$!
-echo "  - Loader PID: $LOADER_PID"
+echo "  - Loader: $LOADER_BIN"
+echo "  - PID: $LOADER_PID"
 sleep 3
 
 if [ -f /sys/kernel/sched_ext/state ]; then
@@ -160,6 +172,11 @@ if [ -f /sys/kernel/sched_ext/state ]; then
         kill $LOADER_PID 2>/dev/null || true
         exit 1
     fi
+fi
+
+if [ -f /sys/kernel/sched_ext/ops ]; then
+    OPS=$(cat /sys/kernel/sched_ext/ops)
+    echo "  - 当前调度器: $OPS"
 fi
 
 echo ""
@@ -266,6 +283,7 @@ if [ -f "$TRACE_FILE" ]; then
     echo "========================================"
     echo "测试完成！"
     echo "========================================"
+    echo "BPF 版本: $BPF_VERSION"
     echo "Trace 文件: $TRACE_FILE"
     echo "文件大小: ${SIZE_MB} MB"
     echo ""

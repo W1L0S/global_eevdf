@@ -1,7 +1,6 @@
 #!/bin/bash
-# EEVDF 调度器主测试脚本
+# Global EEVDF 调度器主测试脚本
 # 支持 CPU / 混合负载 / I/O 密集负载测试
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,6 +87,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --io-only        测试 I/O 密集型负载（频繁睡眠/唤醒）"
             echo "  --duration N     测试时长（秒，默认10）"
             echo "  -h, --help       显示此帮助信息"
+            echo ""
+            echo "示例:"
+            echo "  sudo $0 --cpu-only --duration 10"
+            echo "  sudo $0 --mixed --duration 15"
+            echo "  sudo $0 --io-only --duration 20"
             exit 0
             ;;
         *)
@@ -98,9 +102,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+LOADER_BIN="./build/loader_global_eevdf"
+SCHED_NAME="global_eevdf"
+
 echo "========================================"
-echo "EEVDF 调度器测试"
+echo "Global EEVDF 调度器测试"
 echo "========================================"
+echo "调度器: $SCHED_NAME"
 echo "测试模式: $TEST_MODE"
 echo "测试时长: ${DURATION}秒"
 echo ""
@@ -112,8 +120,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if [ ! -x "./build/loader" ]; then
-    echo "错误：未找到 ./build/loader，请先运行 make"
+if [ ! -x "$LOADER_BIN" ]; then
+    echo "错误：未找到 $LOADER_BIN"
+    echo "请先运行: make $BPF_VERSION"
     exit 1
 fi
 
@@ -138,10 +147,11 @@ echo "[2/5] 启动 ftrace..."
 echo 1 > "$TRACE_DIR/tracing_on"
 
 echo ""
-echo "[3/5] 启动 EEVDF 调度器..."
-./build/loader &
+echo "[3/5] 启动 EEVDF 调度器 ($BPF_VERSION)..."
+$LOADER_BIN &
 LOADER_PID=$!
-echo "  - Loader PID: $LOADER_PID"
+echo "  - Loader: $LOADER_BIN"
+echo "  - PID: $LOADER_PID"
 sleep 3
 
 if [ -f /sys/kernel/sched_ext/state ]; then
@@ -152,6 +162,11 @@ if [ -f /sys/kernel/sched_ext/state ]; then
         kill $LOADER_PID 2>/dev/null || true
         exit 1
     fi
+fi
+
+if [ -f /sys/kernel/sched_ext/ops ]; then
+    OPS=$(cat /sys/kernel/sched_ext/ops)
+    echo "  - 当前调度器: $OPS"
 fi
 
 echo ""
@@ -209,6 +224,7 @@ echo ""
 echo "========================================"
 echo "测试完成！"
 echo "========================================"
+echo "BPF 版本: $BPF_VERSION"
 echo "Trace 文件: $TEXT_TRACE"
 echo "事件数量: $TRACE_LINES 行"
 echo ""

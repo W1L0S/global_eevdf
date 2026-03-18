@@ -3,7 +3,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_experimental.h>
 
-/* --- Configuration Constants --- */
+/* 调度参数 */
 #define NICE_0_LOAD     1024ULL
 #define BASE_SLICE_NS   3000000ULL
 #define MIN_SLICE_NS    1000000ULL
@@ -20,7 +20,7 @@
 
 #include "../../tools/sched_ext/include/scx/common.bpf.h"
 
-/* --- Lookup Tables --- */
+/* 权重表，从 nice 值到权重 */
 static const int eevdf_prio_to_weight[40] = {
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
      9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
@@ -47,8 +47,6 @@ extern void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
 
 char _license[] SEC("license") = "GPL";
 
-/* --- Data Structures --- */
-
 struct eevdf_node {
     struct bpf_rb_node node;
     s32 pid; 
@@ -61,7 +59,7 @@ struct eevdf_node {
 
 struct task_ctx {
     u64 vruntime;
-    s64 vlag;         /* vlag = V - vruntime (正值=落后，负值=超前) */
+    s64 vlag;         /* vlag = V - vruntime */
     u64 last_run_ns;
     u64 saved_vd;
     u64 last_weight;
@@ -89,7 +87,6 @@ struct eevdf_ctx_t {
     u64 run_avg_load;          
 };
 
-/* --- Maps --- */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -775,3 +772,4 @@ static __always_inline void eevdf_avg_add(struct eevdf_ctx_t *sctx, struct eevdf
     sctx->avg_vruntime_sum += key * (s64)w;
     sctx->avg_load += w;
 }
+
