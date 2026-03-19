@@ -21,8 +21,6 @@
 - `src/clutch.bpf.c`：调度核心（enqueue、dispatch、stopping、抢占触发）。
 - `src/loader.c`：用户态加载器，负责 open/load/attach/detach。
 - `include/`：头文件和 `vmlinux.h`。
-- `tests/`：BPF 与 kfunc 相关测试代码。
-- `scripts/`：验证、压测、跟踪脚本。
 - `docs/ARCHITECTURE.md`：完整架构说明与关键公式。
 
 ## 环境要求
@@ -46,19 +44,6 @@ sudo ./build/loader_clutch
 
 停止方式：`Ctrl+C`。
 
-## 常用命令
-
-```bash
-# 编译测试程序
-make test
-
-# 构建 kfunc 测试
-make test-kfuncs
-
-# 执行基础验证脚本
-make test-verify
-```
-
 ## 调度流程速览
 
 1. 任务入队时根据 `home_cpu` 找到所属 cluster，再由 `tgid & 1` 进入其中一个 bucket。
@@ -69,5 +54,4 @@ make test-verify
 ## 文档入口
 
 - 架构说明：`docs/ARCHITECTURE.md`
-- 基准与分析脚本：`scripts/`
 - 输出示例：`output/`

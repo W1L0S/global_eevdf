@@ -14,8 +14,6 @@ VMLINUX := /sys/kernel/btf/vmlinux
 SRC_DIR := src
 BUILD_DIR := build
 INCLUDE_DIR := include
-TESTS_DIR := tests
-SCRIPTS_DIR := scripts
 CONFIGS_DIR := configs
 
 # 主程序目标文件（Per-cluster clutch 调度器）
@@ -26,16 +24,6 @@ USER_APP := $(BUILD_DIR)/loader_clutch
 SCHED_NAME := clutch
 
 USER_SRC := $(SRC_DIR)/loader.c
-
-# 测试程序目标文件
-TEST_BPF_OBJS := $(BUILD_DIR)/test_eevdf.bpf.o \
-                 $(BUILD_DIR)/test_eevdf_new.bpf.o \
-                 $(BUILD_DIR)/test_eevdf_simple.bpf.o
-
-# kfunc 测试程序
-TEST_KFUNCS_BPF := $(BUILD_DIR)/test_kfuncs.bpf.o
-TEST_KFUNCS_SKEL := $(BUILD_DIR)/test_kfuncs.skel.h
-TEST_KFUNCS_APP := $(BUILD_DIR)/test_kfuncs
 
 # BPF 编译选项
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -mcpu=v3 \
@@ -53,7 +41,7 @@ else
 USER_LDFLAGS := $(LIBBPF_A) -lelf -lz
 endif
 
-.PHONY: all clean dirs test test-verify help install-vmlinux
+.PHONY: all clean dirs help install-vmlinux
 
 # 默认目标（Per-cluster clutch 调度器）
 all: dirs $(USER_APP)
@@ -64,9 +52,6 @@ help:
 	@echo ""
 	@echo "可用目标:"
 	@echo "  all              - 编译 per-cluster clutch 调度器（默认）"
-	@echo "  test             - 编译测试程序"
-	@echo "  test-kfuncs      - 编译并生成 kfunc 测试程序"
-	@echo "  test-verify      - 编译并验证测试程序"
 	@echo "  install-vmlinux  - 生成 vmlinux.h 头文件"
 	@echo "  clean            - 清理构建文件"
 	@echo "  help             - 显示此帮助信息"
@@ -95,48 +80,6 @@ $(USER_APP): $(USER_SRC) $(SKEL_H)
 	@echo "编译用户态程序..."
 	$(CC) $(USER_CFLAGS) -DSKEL_H=\"$(notdir $(SKEL_H))\" \
 		$(USER_SRC) -o $(USER_APP) $(USER_LDFLAGS)
-
-# 测试程序编译规则
-$(BUILD_DIR)/test_eevdf.bpf.o: $(TESTS_DIR)/test_eevdf.bpf.c | dirs
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/test_eevdf_new.bpf.o: $(TESTS_DIR)/test_eevdf_new.bpf.c | dirs
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/test_eevdf_simple.bpf.o: $(TESTS_DIR)/test_eevdf_simple.bpf.c | dirs
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-# kfunc 测试程序编译规则
-$(TEST_KFUNCS_BPF): $(TESTS_DIR)/test_kfuncs.bpf.c | dirs
-	@echo "编译 kfunc 测试 BPF 程序..."
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-$(TEST_KFUNCS_SKEL): $(TEST_KFUNCS_BPF)
-	@echo "生成 kfunc 测试 Skeleton..."
-	$(KERNEL_SRC)/tools/bpf/bpftool/bpftool gen skeleton $(TEST_KFUNCS_BPF) > $(TEST_KFUNCS_SKEL)
-
-$(TEST_KFUNCS_APP): $(TESTS_DIR)/test_kfuncs_loader.c $(TEST_KFUNCS_SKEL)
-	@echo "编译 kfunc 测试用户态程序..."
-	$(CC) -g -O2 -I./$(INCLUDE_DIR) -I./$(BUILD_DIR) \
-		-I$(LIBBPF_DIR) -I$(LIBBPF_DIR)/include/uapi \
-		-I$(LIBBPF_DIR)/include -I$(KERNEL_SRC)/tools/include/uapi \
-		$(TESTS_DIR)/test_kfuncs_loader.c -o $(TEST_KFUNCS_APP) \
-		$(USER_LDFLAGS)
-
-# 编译测试程序
-test: dirs $(TEST_BPF_OBJS)
-	@echo "测试程序编译完成"
-
-# 编译 kfunc 测试
-test-kfuncs: dirs $(TEST_KFUNCS_APP)
-	@echo "kfunc 测试程序编译完成"
-	@echo "运行: sudo $(TEST_KFUNCS_APP)"
-
-# 验证测试程序
-test-verify: test
-	@echo ""
-	@echo "运行 BPF 程序验证..."
-	bash $(SCRIPTS_DIR)/verify_bpf.sh
 
 # 清理
 clean:

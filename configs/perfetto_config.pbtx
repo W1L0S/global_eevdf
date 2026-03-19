@@ -68,7 +68,7 @@ data_sources {
   }
 }
 
-# 持续时间（默认30秒，会被 test_perfetto.sh 脚本动态替换）
+# 持续时间（默认30秒，可按需手动调整）
 duration_ms: 30000
 
 # 写入文件模式
