@@ -1,167 +1,202 @@
-# Global EEVDF 架构说明
+# Per-Cluster Clutch/CFS 架构说明
 
-本文档说明 `global_eevdf` 在 `sched_ext` 下的实现方式，重点回答三个问题：
-
-1. 任务状态如何存储。
-2. 调度决策按什么顺序发生。
-3. 为什么这个实现能保持 EEVDF 的公平性与可抢占性。
+当前版本不再使用单一全局 `ready/future` 双树，而是先落一个借鉴 Clutch 思路的三层骨架。当前二层和三层都先按 CFS 风格的 `vruntime` 排序，重点是把层次、节点关系和 `per-cluster` 状态固定下来，后续再逐步补 bucket 分类、选核和抢占。
 
 ## 1. 设计目标
 
-- 全局视角选择任务，而不是每 CPU 独立排队。
-- 严格遵循 EEVDF 的 eligible 条件：$ve \le V$。
-- 维持 Linux 风格 lag 语义：$vlag = V - vruntime$。
-- 在 BPF 约束下控制复杂度和锁持有时间，避免长循环。
+- 从“全局单队列”切到“per-cluster 分层队列”。
+- 先用最小 `vruntime` 驱动二层和三层排序。
+- 第一阶段先把整体容器关系和调度路径固定下来。
+- `select_cpu`、复杂 cluster 放置、抢占逻辑暂时继续保持最简路径。
 
-## 2. 关键状态与数据结构
+## 2. 三层结构
 
-### 2.1 全局状态：`eevdf_ctx` (ARRAY map, 仅 1 项)
+### 2.1 第一层：cluster 顶层 bucket
 
-对应 `struct eevdf_ctx_t`，由 `bpf_spin_lock` 保护，包含：
+`cluster_ctxs` 是一个 ARRAY map，每个 cluster 对应一个轻量的 `struct cluster_ctx`，当前只保存 bucket 轮转游标。
 
-- `ready`：可调度任务树，按 `vd` 升序排序（同 `vd` 按 `pid` 打破平局）。
-- `future`：暂不可调度任务树，按 `ve` 升序排序（同 `ve` 按 `pid` 打破平局）。
-- `V`：系统当前虚拟时间基准。
-- `base_v`、`avg_vruntime_sum`、`avg_load`：就绪任务的加权统计。
-- `run_avg_vruntime_sum`、`run_avg_load`：正在运行任务的加权统计。
+真正的 bucket 容器放在独立的 `bucket_ctxs` ARRAY map 里。每个 cluster 里仍然有两个顶层 bucket：
 
-这组统计量共同决定 $V$ 的推进，而不是靠固定步长累加。
+- `buckets[0]`
+- `buckets[1]`
 
-### 2.2 任务节点：`eevdf_node`
+目前 bucket 只是承载线程组的容器，还没有真实的 Clutch bucket 分类策略。当前实现先用 `tgid & 1` 把线程组稳定地映射到两个桶里，后续可以替换成交互性、负载等级、QoS 或其他策略。
 
-节点存放在 BPF rbtree 中，生命周期短，主要字段：
+### 2.2 第二层：线程组节点
 
-- `ve`：虚拟可运行时间，等于任务当前 `vruntime`。
-- `vd`：虚拟截止时间，$vd = ve + vslice$。
-- `weight`、`wmult`：权重与其倒数乘子缓存。
-- `slice_ns`：本次分配的物理时间片（当前实现固定 3ms）。
+第二层现在拆成两个对象：
 
-### 2.3 任务长期状态：`task_ctx_stor` (TASK_STORAGE)
+- `struct group_ref`
+  作为 bucket 内线程组红黑树节点，是线程组状态的排序快照。
+- `struct group_slot`
+  作为 `(cluster_id, tgid)` 对应的持久化状态，内部保存该线程组下的线程红黑树。
 
-对应 `struct task_ctx`，用于跨事件保留任务上下文：
+`group_nodes` 这个 HASH map 按 `(cluster_id, tgid)` 保存 `group_slot`。bucket 内真正参与二层排序的是 `group_ref` 快照，而第三层线程树放在对应的 `group_slot` 里。
 
-- `vruntime`：任务累计虚拟运行时间。
-- `vlag`：任务相对系统基准的偏差，定义为 $V - vruntime$。
-- `saved_vd`、`last_weight`、`last_run_ns`、`is_running`：运行期辅助信息。
+### 2.3 第三层：线程节点
 
-因为 rbtree 节点会被释放，长期状态必须放到 task storage 才能稳定恢复。
+第三层节点使用 `struct thread_node`，语义是“线程节点”：
 
-### 2.4 每 CPU 运行态：`cpu_run_account` (ARRAY map)
+- `pid` / `tgid` 表示线程身份
+- `dispatch_cpu` 记录当前这个线程的暂定 home CPU
 
-对应 `struct run_accounting`，记录当前 CPU 正在跑的任务统计：
+线程节点是短生命周期对象：enqueue 时创建，dispatch 取出后释放。
 
-- `weight_val`、`key_val`：从就绪集合迁移到运行集合时用到的统计值。
-- `curr_vd`：当前任务 `vd`，供唤醒抢占比较。
-- `wmult`、`valid`：结算和有效性标记。
+## 3. 关键数据结构
 
-## 3. 调度主流程（按时间顺序）
+### 3.1 `struct group_ref`
 
-### 3.1 入队：`eevdf_enqueue`
+二层 bucket 内线程组节点包含：
 
-触发时机：任务变为 runnable。
+- `rb_node`
+  作为 bucket 内线程组红黑树节点。
+- `tgid / cluster_id / bucket_id`
+  标记所属线程组与当前 bucket。
+- `nr_children / dispatch_cpu / vruntime / seq`
+  缓存当前线程组的关键调度字段和快照版本。
 
-执行步骤：
+### 3.2 `struct group_slot`
 
-1. 根据 `nice` 与 cgroup 权重计算 `weight/wmult`。
-2. 计算 `slice_ns` 与 `vslice`。
-3. 恢复任务 `vruntime`：
-   - 新任务：直接贴齐当前 $V$。
-   - 老任务：使用保存的 `vlag` 按 $vruntime = V - vlag$ 恢复，并做上下界限制。
-4. 得到 `ve` 与 `vd`，将节点纳入全局统计。
-5. 重新计算 $V$。
-6. 根据 $ve \le V$ 放入 `ready` 或 `future`。
-7. 如新任务明显更“紧急”，触发 `kick` 促进抢占。
+线程组持久化状态包含：
 
-结果：任务被放入正确队列，且全局时钟与负载统计同步更新。
+- `children`
+  线程组内部线程树，元素类型为 `thread_node`。
+- `lock`
+  保护组内线程红黑树。
+- `tgid / cluster_id / bucket_id`
+  标记所属线程组与 cluster / bucket。
+- `nr_children / dispatch_cpu / vruntime / seq`
+  记录当前线程组的聚合调度状态和当前版本。
 
-### 3.2 派发：`eevdf_dispatch`
+### 3.3 `struct thread_node`
 
-触发时机：CPU 需要新任务。
+三层线程节点包含：
 
-执行步骤：
+- `rb_node`
+  作为 group 内线程红黑树节点。
+- `pid / tgid`
+  标记线程身份。
+- `cluster_id / bucket_id / dispatch_cpu`
+  标记所属 cluster / bucket 与暂定目标 CPU。
+- `vruntime / wmult / slice_ns`
+  当前排序直接使用 `vruntime`，`wmult` 用于运行后折算时间，`slice_ns` 用于 dispatch 时给时间片。
 
-1. 若 `ready` 为空且 `future` 非空，必要时推进 $V$ 到 `future` 最小 `ve`。
-2. 将已满足 $ve \le V$ 的 `future` 节点搬运到 `ready`（有循环上限）。
-3. 从 `ready` 取最小 `vd` 节点。
-4. 做 CPU 亲和性检查：
-   - 本地可运行：走 `SCX_DSQ_LOCAL`。
-   - 本地不可运行：走 `SCX_DSQ_LOCAL_ON | target_cpu` 远程派发。
-5. 将任务统计从 ready 集迁移到 running 集，并更新 `cpu_run_account`。
+### 3.4 `struct cluster_ctx`
 
-结果：系统优先执行“已 eligible 且截止时间最早”的任务，同时兼顾亲和性。
+每个 cluster 拥有：
 
-### 3.3 停止运行：`eevdf_stopping`
+- `next_bucket`
+  dispatch 时用于在两个 bucket 之间轮转起点。
 
-触发时机：任务被切走（时间片用尽、阻塞、主动让出）。
+### 3.5 `struct clutch_bucket`
 
-执行步骤：
+每个 bucket 单独作为 `bucket_ctxs` 的 value，包含：
 
-1. 依据 `delta_ns` 计算本次虚拟运行增量并累加到 `vruntime`。
-2. 将该任务从 running 集统计中移除，重算 $V$。
-3. 保存 `vlag = V - vruntime`，用于下次唤醒恢复。
-4. 清理当前 CPU 的 `run_accounting` 有效位。
-5. 若任务仍 runnable，则立即重新生成节点并回到入队路径。
+- `groups`
+  顶层线程组快照红黑树。
+- `lock`
+  保护 bucket 红黑树。
+- `nr_groups`
+  当前 bucket 内线程组快照数量。
 
-结果：任务历史公平性被保留，系统时钟在任务离开后自动校正。
+### 3.6 `task_ctx_stor`
 
-## 4. 关键公式与判定条件
+任务长期状态仍然放在 TASK_STORAGE：
 
-### 4.1 eligible 判定
+- `vruntime`
+- `last_run_ns`
+- `cluster_id / bucket_id / home_cpu`
 
-$$
-ve \le V
-$$
+### 3.7 `cpu_run_account`
 
-满足时进入 `ready`，否则进入 `future`。
+当前版本保留了每 CPU 的运行态记录，但语义简化为：
 
-### 4.2 虚拟时间片
+- 当前任务的 `wmult`
+- 所属 cluster / bucket
+- `home_cpu`
 
-$$
-vslice = (slice\_ns \times NICE\_0\_LOAD \times wmult) \gg 32
-$$
+它只用于 `stopping` 时把运行时间折算回 `vruntime`。
 
-当前 `slice_ns` 固定为 3ms，公平性主要通过 `wmult` 体现。
+## 4. 当前调度路径
 
-### 4.3 虚拟截止时间
+### 4.1 enqueue
 
-$$
-vd = ve + vslice
-$$
+入队时执行：
 
-`ready` 树始终按最小 `vd` 优先。
+1. 根据任务允许 CPU 集和当前 CPU，挑一个临时 `home_cpu`。
+2. 由 `home_cpu` 映射出 `cluster_id`。
+3. 由 `tgid & 1` 得到 `bucket_id`。
+4. 创建三层线程节点。
+5. 取出或创建对应的线程组节点。
+6. 把线程节点按 `vruntime` 插入线程组内部的红黑树。
+7. 线程组节点按当前最小线程的 `vruntime` 挂到所属 bucket 的红黑树。
 
-### 4.4 lag 保存与恢复
+因此，入队路径现在遵循：
 
-$$
-vlag = V - vruntime
-$$
+`cluster -> bucket -> thread-group -> thread`
 
-恢复时：
+### 4.2 dispatch
 
-$$
-vruntime_{new} = V_{now} - vlag
-$$
+派发时执行：
 
-该公式保证睡眠补偿语义与内核实现一致。
+1. 根据当前 CPU 找到所属 cluster。
+2. 从两个顶层 bucket 中轮流挑一个非空 bucket。
+3. 从该 bucket 的红黑树取出 `vruntime` 最小的线程组节点。
+4. 从线程组节点内部的红黑树取出 `vruntime` 最小的线程节点。
+5. 若线程组还有剩余线程，则按新的最小线程 `vruntime` 重新挂回 bucket 红黑树。
+6. 将线程派发到它记录的 `home_cpu`，若不合法则回退到当前 CPU。
 
-## 5. 并发与复杂度控制
+这一版 dispatch 的顶层仍然只是“两桶轮转”，但二层和三层已经改成单棵红黑树的 CFS 风格选择：
 
-- 全局关键区由 `bpf_spin_lock` 保护。
-- rbtree 操作复杂度为 $O(logN)$。
-- `future -> ready` 搬运与 dispatch peek 均设置循环上限，防止单次 BPF 执行过长。
-- 抢占 kick 受最小间隔限制，避免高频唤醒风暴。
+- bucket 之间做简单轮转
+- bucket 内线程组按最小 `vruntime` 选择
+- 线程组内线程按最小 `vruntime` 选择
 
-## 6. 实现中的不变量
+### 4.3 stopping
 
-- 不变量 1：`ready` 中任一节点都满足 $ve \le V$。
-- 不变量 2：`future` 的树顶是最早可能转入 `ready` 的候选。
-- 不变量 3：进入 CPU 运行的任务必须先从 ready 统计移到 running 统计。
-- 不变量 4：每次 `stopping` 都会更新 `vlag`，确保后续唤醒公平恢复。
+任务停止运行时：
 
-## 7. 与默认调度路径的分工
+1. 用 `delta_ns * wmult` 更新 `vruntime`。
+2. 清理当前 CPU 的运行态记录。
+3. 如果任务仍 runnable，则重新走一次 enqueue，把它重新挂回三层结构。
 
-- `select_cpu` 使用 `scx_bpf_select_cpu_dfl`，负责基础 CPU 选择。
-- `dispatch` 负责 EEVDF 的核心优先级决策。
-- `kick` 机制补足“已有运行任务但新任务更紧急”的抢占触发。
+## 5. 当前没有实现的部分
 
-这种分工让代码保持清晰：CPU 放置策略与全局 EEVDF 决策解耦。
+这次重构明确没有实现下面这些策略：
+
+- 第一层 bucket 的真实分类逻辑
+- cluster 内更精细的 CPU 选择
+- cluster 间迁移策略
+- 抢占判断和 kick 逻辑
+
+换句话说，这个版本的目标是先让结构稳定，而不是让策略完整。
+
+## 6. 并发策略
+
+为了满足 BPF `rbtree` 的锁约束，当前用了三类锁：
+
+- `cluster_ctx.lock`
+  保护 cluster 级别的 cursor 和 group stash 安装过程。
+- `clutch_bucket.lock`
+  保护顶层 bucket 红黑树。
+- `group_slot.lock`
+  保护单个线程组节点内部的线程红黑树。
+
+实现上避免了嵌套持锁，所有跨层操作都拆成分阶段处理：
+
+- 先改 group 内部线程树
+- 再按需要把 group 挂回 bucket 树
+
+这样虽然现在不是最强一致的实现，但更容易通过 BPF verifier，也更适合做第一阶段架构重构。
+
+## 7. 后续扩展点
+
+后面如果继续往更完整的 Clutch 策略推进，建议按这个顺序补：
+
+1. 把 `bucket_id` 从 `tgid & 1` 替换成真实 bucket 分类。
+2. 在二层和三层分别补上你最终想要的 group/thread 选择逻辑。
+3. 再决定 group key 是直接用最小 thread `vruntime`，还是用更完整的 group 聚合指标。
+4. 用真实拓扑替换当前 `cpus_per_cluster` 的静态 cluster 划分。
+5. 再补 cluster 内选核和抢占。
+
+这样可以保证每一步都只改一层策略，不需要再动三层骨架本身。

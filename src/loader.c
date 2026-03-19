@@ -13,7 +13,7 @@ typedef int64_t  s64;
 #ifdef SKEL_H
 #include SKEL_H
 #else
-#include "eevdf.skel.h"
+#include "clutch.skel.h"
 #endif
 
 /* 根据 SKEL_PREFIX 定义正确的 skeleton 名称 */
@@ -49,18 +49,29 @@ static void sig_handler(int sig)
 
 static int bump_memlock_rlimit(void)
 {
-    struct rlimit rlim_new = {
-        .rlim_cur = RLIM_INFINITY,
-        .rlim_max = RLIM_INFINITY,
-    };
+    struct rlimit rlim = {};
+    struct rlimit rlim_new = {};
 
-    return setrlimit(RLIMIT_MEMLOCK, &rlim_new);
+    if (getrlimit(RLIMIT_MEMLOCK, &rlim))
+        return 0;
+
+    if (rlim.rlim_cur == RLIM_INFINITY)
+        return 0;
+
+    rlim_new.rlim_cur = rlim.rlim_max == RLIM_INFINITY ? RLIM_INFINITY : rlim.rlim_max;
+    rlim_new.rlim_max = rlim.rlim_max;
+
+    if (!setrlimit(RLIMIT_MEMLOCK, &rlim_new))
+        return 0;
+
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
     SKEL_TYPE *skel;
     int err;
+    int nr_possible_cpus;
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -71,10 +82,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (geteuid() != 0) {
+        fprintf(stderr, "This loader must be run as root (for example: sudo %s)\n",
+                argv[0]);
+        return 1;
+    }
+
     skel = SKEL_OPEN;
     if (!skel) {
         fprintf(stderr, "Failed to open BPF skeleton\n");
         return 1;
+    }
+
+    nr_possible_cpus = libbpf_num_possible_cpus();
+    if (nr_possible_cpus < 1)
+        nr_possible_cpus = 1;
+
+    if (skel->rodata) {
+        skel->rodata->nr_cpu_ids = (u32)nr_possible_cpus;
+        skel->rodata->cpus_per_cluster = 4;
     }
 
     err = SKEL_LOAD(skel);
@@ -83,8 +109,8 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (skel->struct_ops.eevdf_ops) {
-        skel->struct_ops.eevdf_ops->timeout_ms = 5000;
+    if (skel->struct_ops.clutch_ops) {
+        skel->struct_ops.clutch_ops->timeout_ms = 5000;
     }
 
     err = SKEL_ATTACH(skel);
@@ -93,7 +119,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    printf("Successfully loaded Global EEVDF scheduler.\n");
+    printf("Successfully loaded per-cluster clutch scheduler.\n");
     printf("  - Watchdog: 5000ms\n");
     printf("Press Ctrl+C to stop and detach.\n");
 

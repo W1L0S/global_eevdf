@@ -1,4 +1,4 @@
-# EEVDF Scheduler Makefile
+# Clutch Scheduler Makefile
 CLANG ?= clang-17
 CC ?= gcc
 BPFTOOL ?= bpftool
@@ -7,6 +7,7 @@ ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 # 路径设置
 KERNEL_SRC := /home/hustlhy/linux-6.12.57
 LIBBPF_DIR := $(KERNEL_SRC)/tools/lib/bpf
+LIBBPF_A := $(LIBBPF_DIR)/libbpf.a
 VMLINUX := /sys/kernel/btf/vmlinux
 
 # 目录结构
@@ -17,12 +18,12 @@ TESTS_DIR := tests
 SCRIPTS_DIR := scripts
 CONFIGS_DIR := configs
 
-# 主程序目标文件（Global EEVDF 调度器）
-BPF_SRC := $(SRC_DIR)/global_eevdf.bpf.c
-BPF_OBJ := $(BUILD_DIR)/global_eevdf.bpf.o
-SKEL_H := $(BUILD_DIR)/global_eevdf.skel.h
-USER_APP := $(BUILD_DIR)/loader_global_eevdf
-SCHED_NAME := global_eevdf
+# 主程序目标文件（Per-cluster clutch 调度器）
+BPF_SRC := $(SRC_DIR)/clutch.bpf.c
+BPF_OBJ := $(BUILD_DIR)/clutch.bpf.o
+SKEL_H := $(BUILD_DIR)/clutch.skel.h
+USER_APP := $(BUILD_DIR)/loader_clutch
+SCHED_NAME := clutch
 
 USER_SRC := $(SRC_DIR)/loader.c
 
@@ -45,19 +46,24 @@ USER_CFLAGS := -g -O2 -I./$(INCLUDE_DIR) -I./$(BUILD_DIR) \
                -DSKEL_PREFIX=$(SCHED_NAME) \
                -I$(LIBBPF_DIR) -I$(LIBBPF_DIR)/include/uapi \
                -I$(LIBBPF_DIR)/include -I$(KERNEL_SRC)/tools/include/uapi
-USER_LDFLAGS := $(LIBBPF_DIR)/libbpf.a -lelf -lz
+
+ifeq ($(wildcard $(LIBBPF_A)),)
+USER_LDFLAGS := -L$(LIBBPF_DIR) -Wl,-rpath,$(LIBBPF_DIR) -lbpf -lelf -lz
+else
+USER_LDFLAGS := $(LIBBPF_A) -lelf -lz
+endif
 
 .PHONY: all clean dirs test test-verify help install-vmlinux
 
-# 默认目标（Global EEVDF 调度器）
+# 默认目标（Per-cluster clutch 调度器）
 all: dirs $(USER_APP)
 
 # 帮助信息
 help:
-	@echo "EEVDF Scheduler Makefile"
+	@echo "Clutch Scheduler Makefile"
 	@echo ""
 	@echo "可用目标:"
-	@echo "  all              - 编译 Global EEVDF 调度器（默认）"
+	@echo "  all              - 编译 per-cluster clutch 调度器（默认）"
 	@echo "  test             - 编译测试程序"
 	@echo "  test-kfuncs      - 编译并生成 kfunc 测试程序"
 	@echo "  test-verify      - 编译并验证测试程序"
@@ -76,7 +82,7 @@ install-vmlinux: dirs
 
 # 1. 编译主 BPF 程序
 $(BPF_OBJ): $(BPF_SRC) | dirs
-	@echo "编译 BPF 程序 (global_eevdf)..."
+	@echo "编译 BPF 程序 (clutch)..."
 	$(CLANG) $(BPF_CFLAGS) -c $(BPF_SRC) -o $(BPF_OBJ)
 
 # 2. 生成 Skeleton

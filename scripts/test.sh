@@ -102,11 +102,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-LOADER_BIN="./build/loader_global_eevdf"
-SCHED_NAME="global_eevdf"
+LOADER_BIN="./build/loader_clutch"
+SCHED_NAME="global_clutch"
 
 echo "========================================"
-echo "Global EEVDF 调度器测试"
+echo "Per-cluster clutch 调度器测试"
 echo "========================================"
 echo "调度器: $SCHED_NAME"
 echo "测试模式: $TEST_MODE"
@@ -147,7 +147,7 @@ echo "[2/5] 启动 ftrace..."
 echo 1 > "$TRACE_DIR/tracing_on"
 
 echo ""
-echo "[3/5] 启动 EEVDF 调度器 ($BPF_VERSION)..."
+echo "[3/5] 启动 clutch 调度器 ($BPF_VERSION)..."
 $LOADER_BIN &
 LOADER_PID=$!
 echo "  - Loader: $LOADER_BIN"

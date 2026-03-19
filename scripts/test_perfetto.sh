@@ -109,11 +109,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-LOADER_BIN="./build/loader_global_eevdf"
-SCHED_NAME="global_eevdf"
+LOADER_BIN="./build/loader_clutch"
+SCHED_NAME="global_clutch"
 
 echo "========================================"
-echo "Global EEVDF 调度器 Perfetto 测试"
+echo "Per-cluster clutch 调度器 Perfetto 测试"
 echo "========================================"
 echo "调度器: $SCHED_NAME"
 echo "测试模式: $TEST_MODE"

@@ -92,15 +92,15 @@ if [ "$BUILD" = true ]; then
     make
 fi
 
-if [ ! -x "./build/loader_global_eevdf" ]; then
-    echo "错误：未找到 ./build/loader_global_eevdf"
+if [ ! -x "./build/loader_clutch" ]; then
+    echo "错误：未找到 ./build/loader_clutch"
     echo "请先运行: make"
     exit 1
 fi
 
 if command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f "./build/loader_global_eevdf" >/dev/null 2>&1; then
-        echo "错误：检测到 loader_global_eevdf 正在运行，请先停止"
+    if pgrep -f "./build/loader_clutch" >/dev/null 2>&1; then
+        echo "错误：检测到 loader_clutch 正在运行，请先停止"
         exit 1
     fi
 fi
@@ -136,7 +136,7 @@ set_sched_ext_state() {
 }
 
 start_dual_tree() {
-    ./build/loader_global_eevdf &
+    ./build/loader_clutch &
     LOADER_PID=$!
     sleep 3
     if [ -f /sys/kernel/sched_ext/state ]; then
