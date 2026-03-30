@@ -55,20 +55,20 @@ struct thread_node {
 
 struct group_ref {
     struct bpf_rb_node rb_node;
-    s32 tgid;
+    s32 pid;
     s32 dispatch_cpu;
     u32 cluster_id;
     u32 bucket_id;
     u32 nr_children;
     u64 vruntime;
-    /* 唯一化同组多个并发调度令牌，保证 rbtree 节点可重复插入。 */
+    /* 唯一化同线程多个并发调度令牌，保证 rbtree 节点可重复插入。 */
     u64 seq;
 };
 
 struct group_slot {
     struct bpf_rb_root children __contains(thread_node, rb_node);
     struct bpf_spin_lock lock;
-    s32 tgid;
+    s32 pid;
     s32 dispatch_cpu;
     u32 cluster_id;
     u32 bucket_id;
@@ -90,7 +90,7 @@ struct cluster_ctx {
 
 struct group_key {
     u32 cluster_id;
-    s32 tgid;
+    s32 pid;
 };
 
 struct task_ctx {
@@ -148,7 +148,7 @@ struct {
     __type(value, struct run_accounting);
 } cpu_run_account SEC(".maps");
 
-/* 比较两个组节点在红黑树中的先后顺序，优先按 vruntime，之后再用 tgid、
+/* 比较两个组节点在红黑树中的先后顺序，优先按 vruntime，之后再用 pid、
  * cluster_id 和 seq 打破平局，保证树中顺序稳定且可重复。
  */
 static bool clutch_group_less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
@@ -158,8 +158,8 @@ static bool clutch_group_less(struct bpf_rb_node *a, const struct bpf_rb_node *b
 
     if (na->vruntime != nb->vruntime)
         return na->vruntime < nb->vruntime;
-    if (na->tgid != nb->tgid)
-        return na->tgid < nb->tgid;
+    if (na->pid != nb->pid)
+        return na->pid < nb->pid;
     if (na->cluster_id != nb->cluster_id)
         return na->cluster_id < nb->cluster_id;
     return na->seq < nb->seq;
@@ -254,10 +254,10 @@ static __always_inline s32 clutch_pick_home_cpu(struct task_struct *p)
     return 0;
 }
 
-/* 根据 tgid 计算 bucket 编号，把不同进程组散列到不同 bucket。 */
-static __always_inline u32 clutch_bucket_id(s32 tgid)
+/* 根据 pid 计算 bucket 编号，把不同线程散列到不同 bucket。 */
+static __always_inline u32 clutch_bucket_id(s32 pid)
 {
-    return ((u32)tgid) & (NR_CLUTCH_BUCKETS - 1);
+    return ((u32)pid) & (NR_CLUTCH_BUCKETS - 1);
 }
 
 /* 获取指定 cluster 的上下文对象，用于记录轮转到哪个 bucket。 */
@@ -342,13 +342,13 @@ static __always_inline bool clutch_refresh_group_key_locked(struct group_slot *g
 }
 
 /* 把 group_slot 中的最新状态同步到 group_ref。
- * group_ref 是放在 bucket 红黑树中的轻量级“组令牌”节点。
- * 每个入队线程都会生成一个令牌，支持同组线程并发被多个 CPU 消费。
+ * group_ref 是放在 bucket 红黑树中的轻量级“线程令牌”节点。
+ * 每个入队线程都会生成一个线程令牌，支持同一线程的并发调度令牌被多个 CPU 消费。
  */
 static __always_inline void clutch_sync_group_ref(struct group_ref *group_ref,
                                                   struct group_slot *slot)
 {
-    group_ref->tgid = slot->tgid;
+    group_ref->pid = slot->pid;
     group_ref->cluster_id = slot->cluster_id;
     group_ref->bucket_id = slot->bucket_id;
     group_ref->dispatch_cpu = slot->dispatch_cpu;
@@ -367,7 +367,7 @@ clutch_alloc_group_ref(const struct group_key *key, u32 bucket_id)
     if (!group_ref)
         return NULL;
 
-    group_ref->tgid = key->tgid;
+    group_ref->pid = key->pid;
     group_ref->cluster_id = key->cluster_id;
     group_ref->bucket_id = bucket_id;
     group_ref->dispatch_cpu = -1;
@@ -415,8 +415,8 @@ clutch_alloc_thread_node(struct task_struct *p, struct task_ctx *tctx,
     return node;
 }
 
-/* 把组节点插入 bucket 的红黑树。
- * bucket 层只关心“这个组当前最该被调度的线程是谁”，不直接保存线程本体。
+/* 把线程令牌节点插入 bucket 的红黑树。
+ * bucket 层只关心“这个线程令牌当前最该被调度的线程是谁”，不直接保存线程本体。
  */
 static __always_inline void clutch_bucket_add_group(struct clutch_bucket *bucket,
                                                     struct group_ref *group)
@@ -430,8 +430,8 @@ static __always_inline void clutch_bucket_add_group(struct clutch_bucket *bucket
     bpf_spin_unlock(&bucket->lock);
 }
 
-/* 把线程挂入所属组，并为该组在 bucket 中放入一个新的 group_ref 令牌。
- * 令牌按线程维度生成，允许同一个线程组被多个 CPU 并发消费。
+/* 把线程挂入所属槽位（沿用 group 命名），并在 bucket 中放入一个新的线程令牌。
+ * 令牌按线程维度生成，允许同一线程存在多个并发调度令牌。
  */
 static __always_inline int clutch_queue_thread(struct group_slot *slot,
                                                const struct group_key *key,
@@ -475,8 +475,8 @@ static __always_inline int clutch_queue_thread(struct group_slot *slot,
 }
 
 /* 把一个任务接入 clutch 调度结构。
- * 过程包括：获取任务私有上下文、确定 home cpu/cluster/bucket、找到组槽位、
- * 创建线程节点，并把它加入组树和 bucket 树。
+ * 过程包括：获取任务私有上下文、确定 home cpu/cluster/bucket、找到线程槽位、
+ * 创建线程节点，并把它加入线程树和 bucket 树。
  */
 static __always_inline int clutch_enqueue_task(struct task_struct *p)
 {
@@ -494,17 +494,17 @@ static __always_inline int clutch_enqueue_task(struct task_struct *p)
 
     home_cpu = clutch_pick_home_cpu(p);
     cluster_id = clutch_cpu_to_cluster(home_cpu);
-    bucket_id = clutch_bucket_id(p->tgid);
+    bucket_id = clutch_bucket_id(p->pid);
 
     key.cluster_id = cluster_id;
-    key.tgid = p->tgid;
+    key.pid = p->pid;
 
     slot = clutch_group_slot(&key);
     if (!slot)
         return -1;
 
     slot->cluster_id = cluster_id;
-    slot->tgid = p->tgid;
+    slot->pid = p->pid;
     slot->bucket_id = bucket_id;
 
     thread = clutch_alloc_thread_node(p, tctx, cluster_id, bucket_id, home_cpu);
@@ -650,7 +650,7 @@ s32 BPF_PROG(clutch_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fl
 
 SEC("struct_ops/enqueue")
 /* 任务入队入口。
- * 优先尝试进入 clutch 的组/线程层次结构；如果失败，再回退到全局 DSQ。
+ * 优先尝试进入 clutch 的线程层次结构；如果失败，再回退到全局 DSQ。
  */
 int BPF_PROG(clutch_enqueue, struct task_struct *p, u64 enq_flags)
 {
@@ -662,7 +662,7 @@ int BPF_PROG(clutch_enqueue, struct task_struct *p, u64 enq_flags)
 
 SEC("struct_ops/dispatch")
 /* 某个 CPU 需要新任务时的派发入口。
- * 流程是：先按 cluster 取一个组令牌，再从组内取最小 vruntime 的线程，
+ * 流程是：先按 cluster 取一个线程令牌，再从槽位内取最小 vruntime 的线程，
  * 最后把线程 dispatch 出去。
  */
 int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
@@ -694,7 +694,7 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     key.cluster_id = group->cluster_id;
-    key.tgid = group->tgid;
+    key.pid = group->pid;
     slot = bpf_map_lookup_elem(&group_nodes, &key);
     if (!slot) {
         bpf_obj_drop(group);
