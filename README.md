@@ -47,8 +47,8 @@ sudo ./build/loader_clutch
 ## 调度流程速览
 
 1. 任务入队时根据 `home_cpu` 找到所属 cluster，再由 `tgid & 1` 进入其中一个 bucket。
-2. 线程先插入所属线程组的红黑树，线程组再按当前最小 `vruntime` 挂进 bucket 红黑树。
-3. dispatch 时先在 cluster 的两个 bucket 之间轮转，再逐层取最小 `vruntime` 的 group 和 thread。
+2. 线程先插入所属线程组的红黑树，并按线程粒度生成可消费的 group 令牌挂入 bucket 红黑树。
+3. dispatch 时先在 cluster 的两个 bucket 之间轮转，再消费一个令牌并从对应 group 里取最小 `vruntime` 的 thread。
 4. 任务停机时按运行时间更新 `vruntime`，若仍 runnable 则重新入队。
 
 ## 文档入口

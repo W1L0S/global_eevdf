@@ -3,12 +3,17 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <errno.h>
 #include <bpf/libbpf.h>
 
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int32_t  s32;
 typedef int64_t  s64;
+
+#define MAX_CPUS 256
+#define CORES_PER_CLUSTER 5
 
 #ifdef SKEL_H
 #include SKEL_H
@@ -42,6 +47,15 @@ typedef int64_t  s64;
 
 static volatile bool exiting = false;
 
+struct cluster_topology {
+    u32 cpu_to_cluster[MAX_CPUS];
+    u32 cluster_sizes[MAX_CPUS];
+    s32 raw_cluster_ids[MAX_CPUS];
+    u32 nr_clusters;
+    bool ready;
+    const char *source_name;
+};
+
 static void sig_handler(int sig)
 {
     exiting = true;
@@ -67,9 +81,131 @@ static int bump_memlock_rlimit(void)
     return 0;
 }
 
+static int read_topology_id(u32 cpu, const char *name, s32 *value)
+{
+    char path[128];
+    FILE *fp;
+
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%u/topology/%s", cpu, name);
+
+    fp = fopen(path, "r");
+    if (!fp)
+        return -errno;
+
+    if (fscanf(fp, "%d", value) != 1) {
+        fclose(fp);
+        return -EINVAL;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int build_cluster_topology(struct cluster_topology *topo,
+                                  const s32 *ids, u32 nr_cpus,
+                                  const char *source_name)
+{
+    u32 cpu;
+
+    *topo = (struct cluster_topology){};
+
+    for (cpu = 0; cpu < nr_cpus; cpu++) {
+        u32 cluster;
+
+        for (cluster = 0; cluster < topo->nr_clusters; cluster++) {
+            if (topo->raw_cluster_ids[cluster] == ids[cpu])
+                break;
+        }
+
+        if (cluster == topo->nr_clusters) {
+            if (topo->nr_clusters >= MAX_CPUS)
+                return -E2BIG;
+
+            topo->raw_cluster_ids[topo->nr_clusters] = ids[cpu];
+            cluster = topo->nr_clusters++;
+        }
+
+        topo->cpu_to_cluster[cpu] = cluster;
+        topo->cluster_sizes[cluster]++;
+    }
+
+    topo->ready = topo->nr_clusters > 0;
+    topo->source_name = source_name;
+    return topo->ready ? 0 : -ENOENT;
+}
+
+static int detect_cluster_topology(struct cluster_topology *topo, int nr_possible_cpus)
+{
+    u32 nr_cpus = nr_possible_cpus > MAX_CPUS ? MAX_CPUS : (u32)nr_possible_cpus;
+    s32 core_ids[MAX_CPUS];
+    s32 grouped_core_ids[MAX_CPUS];
+    s32 uniq_core_ids[MAX_CPUS];
+    u32 nr_uniq_cores = 0;
+    u32 cpu;
+
+    for (cpu = 0; cpu < nr_cpus; cpu++) {
+        if (read_topology_id(cpu, "core_id", &core_ids[cpu]) < 0 ||
+            core_ids[cpu] < 0)
+            core_ids[cpu] = (s32)cpu;
+    }
+
+    for (cpu = 0; cpu < nr_cpus; cpu++) {
+        u32 core_idx;
+
+        for (core_idx = 0; core_idx < nr_uniq_cores; core_idx++) {
+            if (uniq_core_ids[core_idx] == core_ids[cpu])
+                break;
+        }
+
+        if (core_idx == nr_uniq_cores) {
+            if (nr_uniq_cores >= MAX_CPUS)
+                return -E2BIG;
+
+            uniq_core_ids[nr_uniq_cores++] = core_ids[cpu];
+        }
+
+        grouped_core_ids[cpu] = (s32)(core_idx / CORES_PER_CLUSTER);
+    }
+
+    return build_cluster_topology(topo, grouped_core_ids, nr_cpus,
+                                  "vm core groups (5 cores per cluster)");
+}
+
+static void print_cluster_topology(const struct cluster_topology *topo, int nr_possible_cpus)
+{
+    u32 nr_cpus = nr_possible_cpus > MAX_CPUS ? MAX_CPUS : (u32)nr_possible_cpus;
+    u32 cluster, cpu;
+
+    if (!topo->ready)
+        return;
+
+    printf("Detected CPU topology from sysfs:\n");
+    printf("  - source: %s\n", topo->source_name ?: "unknown");
+    printf("  - clusters: %u\n", topo->nr_clusters);
+
+    for (cluster = 0; cluster < topo->nr_clusters; cluster++) {
+        bool first = true;
+
+        printf("  - cluster %u (sysfs id %d, cpus %u): ",
+               cluster, topo->raw_cluster_ids[cluster], topo->cluster_sizes[cluster]);
+
+        for (cpu = 0; cpu < nr_cpus; cpu++) {
+            if (topo->cpu_to_cluster[cpu] != cluster)
+                continue;
+
+            printf("%s%u", first ? "" : ",", cpu);
+            first = false;
+        }
+
+        printf("\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     SKEL_TYPE *skel;
+    struct cluster_topology topo;
     int err;
     int nr_possible_cpus;
 
@@ -98,9 +234,20 @@ int main(int argc, char **argv)
     if (nr_possible_cpus < 1)
         nr_possible_cpus = 1;
 
+    err = detect_cluster_topology(&topo, nr_possible_cpus);
+    if (err)
+        topo = (struct cluster_topology){};
+
     if (skel->rodata) {
+        u32 cpu;
+
         skel->rodata->nr_cpu_ids = (u32)nr_possible_cpus;
-        skel->rodata->cpus_per_cluster = 4;
+        skel->rodata->cpus_per_cluster =
+            topo.ready && topo.nr_clusters ? (u32)nr_possible_cpus / topo.nr_clusters : 4;
+        skel->rodata->cpu_cluster_map_ready = topo.ready ? 1 : 0;
+
+        for (cpu = 0; cpu < (u32)nr_possible_cpus && cpu < MAX_CPUS; cpu++)
+            skel->rodata->cpu_cluster_map[cpu] = topo.cpu_to_cluster[cpu];
     }
 
     err = SKEL_LOAD(skel);
@@ -120,6 +267,10 @@ int main(int argc, char **argv)
     }
 
     printf("Successfully loaded per-cluster clutch scheduler.\n");
+    if (topo.ready)
+        print_cluster_topology(&topo, nr_possible_cpus);
+    else
+        printf("  - cluster topology: sysfs unavailable, fallback to fixed-width mapping\n");
     printf("  - Watchdog: 5000ms\n");
     printf("Press Ctrl+C to stop and detach.\n");
 

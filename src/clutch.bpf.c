@@ -38,6 +38,8 @@ char _license[] SEC("license") = "GPL";
 
 const volatile u32 nr_cpu_ids = MAX_CPUS;
 const volatile u32 cpus_per_cluster = DEFAULT_CPUS_PER_CLUSTER;
+const volatile u32 cpu_cluster_map[MAX_CPUS];
+const volatile u32 cpu_cluster_map_ready;
 
 struct thread_node {
     struct bpf_rb_node rb_node;
@@ -59,6 +61,7 @@ struct group_ref {
     u32 bucket_id;
     u32 nr_children;
     u64 vruntime;
+    /* 唯一化同组多个并发调度令牌，保证 rbtree 节点可重复插入。 */
     u64 seq;
 };
 
@@ -88,15 +91,6 @@ struct cluster_ctx {
 struct group_key {
     u32 cluster_id;
     s32 tgid;
-};
-
-struct group_snapshot {
-    struct group_key key;
-    u32 bucket_id;
-    u32 nr_children;
-    s32 dispatch_cpu;
-    u64 vruntime;
-    u64 seq;
 };
 
 struct task_ctx {
@@ -154,6 +148,9 @@ struct {
     __type(value, struct run_accounting);
 } cpu_run_account SEC(".maps");
 
+/* 比较两个组节点在红黑树中的先后顺序，优先按 vruntime，之后再用 tgid、
+ * cluster_id 和 seq 打破平局，保证树中顺序稳定且可重复。
+ */
 static bool clutch_group_less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 {
     struct group_ref *na = container_of(a, struct group_ref, rb_node);
@@ -168,6 +165,9 @@ static bool clutch_group_less(struct bpf_rb_node *a, const struct bpf_rb_node *b
     return na->seq < nb->seq;
 }
 
+/* 比较同一组内两个线程节点在红黑树中的顺序，优先选择 vruntime 更小的线程，
+ * 当 vruntime 相等时再按 pid、tgid 排序。
+ */
 static bool clutch_thread_less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 {
     struct thread_node *na = container_of(a, struct thread_node, rb_node);
@@ -180,6 +180,7 @@ static bool clutch_thread_less(struct bpf_rb_node *a, const struct bpf_rb_node *
     return na->tgid < nb->tgid;
 }
 
+/* 返回当前调度器认为可用的 CPU 数量，并把结果限制在 MAX_CPUS 范围内。 */
 static __always_inline u32 clutch_nr_cpus(void)
 {
     u32 nr = nr_cpu_ids;
@@ -190,6 +191,9 @@ static __always_inline u32 clutch_nr_cpus(void)
     return nr;
 }
 
+/* 计算每个 cluster 包含多少个 CPU。
+ * 如果用户没有配置或者配置越界，就回退到默认值并做边界修正。
+ */
 static __always_inline u32 clutch_cpus_per_cluster(void)
 {
     u32 width = cpus_per_cluster;
@@ -205,10 +209,13 @@ static __always_inline u32 clutch_cpus_per_cluster(void)
     return width;
 }
 
+/* 把 CPU 编号映射到 cluster 编号。
+ * 如果用户态已经写入真实拓扑映射，则直接按真实 cluster 归类；
+ * 否则退回到按固定 cluster 宽度切分的旧逻辑。
+ */
 static __always_inline u32 clutch_cpu_to_cluster(s32 cpu)
 {
     u32 nr = clutch_nr_cpus();
-    u32 width = clutch_cpus_per_cluster();
     u32 cid;
 
     if (cpu < 0)
@@ -216,13 +223,22 @@ static __always_inline u32 clutch_cpu_to_cluster(s32 cpu)
     if ((u32)cpu >= nr)
         cpu = nr - 1;
 
-    cid = (u32)cpu / width;
+    if (cpu_cluster_map_ready) {
+        cid = cpu_cluster_map[(u32)cpu];
+        if (cid < MAX_CLUSTERS)
+            return cid;
+    }
+
+    cid = (u32)cpu / clutch_cpus_per_cluster();
     if (cid >= MAX_CLUSTERS)
         cid = MAX_CLUSTERS - 1;
 
     return cid;
 }
 
+/* 为任务挑选一个“归属 CPU”。
+ * 优先使用任务当前 CPU；若不可用，再从允许的 cpumask 中任意选一个。
+ */
 static __always_inline s32 clutch_pick_home_cpu(struct task_struct *p)
 {
     s32 cpu = scx_bpf_task_cpu(p);
@@ -238,11 +254,13 @@ static __always_inline s32 clutch_pick_home_cpu(struct task_struct *p)
     return 0;
 }
 
+/* 根据 tgid 计算 bucket 编号，把不同进程组散列到不同 bucket。 */
 static __always_inline u32 clutch_bucket_id(s32 tgid)
 {
     return ((u32)tgid) & (NR_CLUTCH_BUCKETS - 1);
 }
 
+/* 获取指定 cluster 的上下文对象，用于记录轮转到哪个 bucket。 */
 static __always_inline struct cluster_ctx *clutch_cluster_ctx(u32 cluster_id)
 {
     if (cluster_id >= MAX_CLUSTERS)
@@ -251,6 +269,7 @@ static __always_inline struct cluster_ctx *clutch_cluster_ctx(u32 cluster_id)
     return bpf_map_lookup_elem(&cluster_ctxs, &cluster_id);
 }
 
+/* 获取某个 cluster 下某个 bucket 的上下文。 */
 static __always_inline struct clutch_bucket *clutch_bucket_ctx(u32 cluster_id, u32 bucket_id)
 {
     u32 idx;
@@ -262,6 +281,9 @@ static __always_inline struct clutch_bucket *clutch_bucket_ctx(u32 cluster_id, u
     return bpf_map_lookup_elem(&bucket_ctxs, &idx);
 }
 
+/* 按 group_key 查找组状态。
+ * 如果该组还不存在，就在 map 中创建一个空的 group_slot。
+ */
 static __always_inline struct group_slot *clutch_group_slot(struct group_key *key)
 {
     struct group_slot empty = {};
@@ -275,6 +297,9 @@ static __always_inline struct group_slot *clutch_group_slot(struct group_key *ke
     return bpf_map_lookup_elem(&group_nodes, key);
 }
 
+/* 根据静态优先级和 cgroup/scx 权重计算权重倒数 wmult。
+ * 后续会用它把真实运行时间换算成 vruntime 增量。
+ */
 static __always_inline u64 clutch_compute_wmult(struct task_struct *p, int idx)
 {
     u64 base_w = clutch_prio_to_weight[idx];
@@ -290,11 +315,17 @@ static __always_inline u64 clutch_compute_wmult(struct task_struct *p, int idx)
     return ((u64)1 << 32) / base_w;
 }
 
+/* 计算任务本次 dispatch 的时间片。
+ * 当前实现固定返回默认时间片，后续可以在这里接入更复杂的策略。
+ */
 static __always_inline u64 clutch_calculate_slice(struct task_struct *p)
 {
     return DEFAULT_SLICE_NS;
 }
 
+/* 在持有 group 锁的情况下，用组内最小 vruntime 的线程刷新组级元数据。
+ * 返回 false 表示组内已经没有线程可供调度。
+ */
 static __always_inline bool clutch_refresh_group_key_locked(struct group_slot *group)
 {
     struct bpf_rb_node *rb;
@@ -310,6 +341,10 @@ static __always_inline bool clutch_refresh_group_key_locked(struct group_slot *g
     return true;
 }
 
+/* 把 group_slot 中的最新状态同步到 group_ref。
+ * group_ref 是放在 bucket 红黑树中的轻量级“组令牌”节点。
+ * 每个入队线程都会生成一个令牌，支持同组线程并发被多个 CPU 消费。
+ */
 static __always_inline void clutch_sync_group_ref(struct group_ref *group_ref,
                                                   struct group_slot *slot)
 {
@@ -322,6 +357,7 @@ static __always_inline void clutch_sync_group_ref(struct group_ref *group_ref,
     group_ref->seq = slot->seq;
 }
 
+/* 为一个组分配新的 group_ref 节点，供 bucket 红黑树使用。 */
 static __always_inline struct group_ref *
 clutch_alloc_group_ref(const struct group_key *key, u32 bucket_id)
 {
@@ -339,6 +375,9 @@ clutch_alloc_group_ref(const struct group_key *key, u32 bucket_id)
     return group_ref;
 }
 
+/* 为待入队任务构造线程节点。
+ * 这里会填充调度所需的权重、时间片、cluster/bucket 以及当前 vruntime。
+ */
 static __always_inline struct thread_node *
 clutch_alloc_thread_node(struct task_struct *p, struct task_ctx *tctx,
                          u32 cluster_id, u32 bucket_id, s32 home_cpu)
@@ -376,6 +415,9 @@ clutch_alloc_thread_node(struct task_struct *p, struct task_ctx *tctx,
     return node;
 }
 
+/* 把组节点插入 bucket 的红黑树。
+ * bucket 层只关心“这个组当前最该被调度的线程是谁”，不直接保存线程本体。
+ */
 static __always_inline void clutch_bucket_add_group(struct clutch_bucket *bucket,
                                                     struct group_ref *group)
 {
@@ -388,6 +430,9 @@ static __always_inline void clutch_bucket_add_group(struct clutch_bucket *bucket
     bpf_spin_unlock(&bucket->lock);
 }
 
+/* 把线程挂入所属组，并为该组在 bucket 中放入一个新的 group_ref 令牌。
+ * 令牌按线程维度生成，允许同一个线程组被多个 CPU 并发消费。
+ */
 static __always_inline int clutch_queue_thread(struct group_slot *slot,
                                                const struct group_key *key,
                                                struct thread_node *thread)
@@ -429,6 +474,10 @@ static __always_inline int clutch_queue_thread(struct group_slot *slot,
     return 0;
 }
 
+/* 把一个任务接入 clutch 调度结构。
+ * 过程包括：获取任务私有上下文、确定 home cpu/cluster/bucket、找到组槽位、
+ * 创建线程节点，并把它加入组树和 bucket 树。
+ */
 static __always_inline int clutch_enqueue_task(struct task_struct *p)
 {
     struct task_ctx *tctx;
@@ -468,6 +517,9 @@ static __always_inline int clutch_enqueue_task(struct task_struct *p)
     return 0;
 }
 
+/* 把选中的线程真正 dispatch 到某个 CPU。
+ * 同时记录本次运行需要的记账信息，供 stopping 回调更新 vruntime。
+ */
 static __noinline int clutch_dispatch_thread(struct thread_node *thread, s32 cpu)
 {
     struct task_struct *p;
@@ -526,26 +578,7 @@ static __noinline int clutch_dispatch_thread(struct thread_node *thread, s32 cpu
     return 0;
 }
 
-static __noinline void clutch_requeue_group(struct clutch_bucket *bucket,
-                                            const struct group_snapshot *snapshot)
-{
-    struct group_ref *group;
-
-    if (!bucket || !snapshot || !snapshot->nr_children)
-        return;
-
-    group = clutch_alloc_group_ref(&snapshot->key, snapshot->bucket_id);
-    if (!group)
-        return;
-
-    group->nr_children = snapshot->nr_children;
-    group->dispatch_cpu = snapshot->dispatch_cpu;
-    group->vruntime = snapshot->vruntime;
-    group->seq = snapshot->seq;
-
-    clutch_bucket_add_group(bucket, group);
-}
-
+/* 从 bucket 中取出当前最应该运行的组，也就是红黑树最左侧节点。 */
 static __always_inline struct group_ref *
 clutch_pop_group_from_bucket(struct clutch_bucket *bucket)
 {
@@ -573,6 +606,9 @@ clutch_pop_group_from_bucket(struct clutch_bucket *bucket)
     return NULL;
 }
 
+/* 在 cluster 内选择下一个组。
+ * 这里在两个 bucket 间轮转，尝试兼顾不同 bucket 中的组。
+ */
 static __always_inline struct group_ref *
 clutch_pick_group(struct cluster_ctx *cluster, u32 cluster_id)
 {
@@ -602,6 +638,9 @@ clutch_pick_group(struct cluster_ctx *cluster, u32 cluster_id)
 }
 
 SEC("struct_ops/select_cpu")
+/* 任务唤醒时的 CPU 选择回调。
+ * 当前直接复用 sched_ext 默认实现，不在这里做自定义负载均衡。
+ */
 s32 BPF_PROG(clutch_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     bool is_idle = false;
@@ -610,6 +649,9 @@ s32 BPF_PROG(clutch_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fl
 }
 
 SEC("struct_ops/enqueue")
+/* 任务入队入口。
+ * 优先尝试进入 clutch 的组/线程层次结构；如果失败，再回退到全局 DSQ。
+ */
 int BPF_PROG(clutch_enqueue, struct task_struct *p, u64 enq_flags)
 {
     if (clutch_enqueue_task(p))
@@ -619,18 +661,19 @@ int BPF_PROG(clutch_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 SEC("struct_ops/dispatch")
+/* 某个 CPU 需要新任务时的派发入口。
+ * 流程是：先按 cluster 取一个组令牌，再从组内取最小 vruntime 的线程，
+ * 最后把线程 dispatch 出去。
+ */
 int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
 {
     struct cluster_ctx *cluster;
-    struct clutch_bucket *bucket;
     struct group_ref *group;
     struct group_slot *slot;
     struct thread_node *thread;
     struct bpf_rb_node *rb;
     struct group_key key;
-    struct group_snapshot next_snapshot;
     u32 cluster_id;
-    bool has_more;
 
     if (cpu < 0 || cpu >= MAX_CPUS) {
         scx_bpf_consume(SCX_DSQ_GLOBAL);
@@ -650,13 +693,6 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
         return 0;
     }
 
-    bucket = clutch_bucket_ctx(group->cluster_id, group->bucket_id);
-    if (!bucket) {
-        bpf_obj_drop(group);
-        scx_bpf_consume(SCX_DSQ_GLOBAL);
-        return 0;
-    }
-
     key.cluster_id = group->cluster_id;
     key.tgid = group->tgid;
     slot = bpf_map_lookup_elem(&group_nodes, &key);
@@ -667,7 +703,7 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     bpf_spin_lock(&slot->lock);
-    if (slot->seq != group->seq || !slot->nr_children) {
+    if (!slot->nr_children) {
         bpf_spin_unlock(&slot->lock);
         bpf_obj_drop(group);
         scx_bpf_consume(SCX_DSQ_GLOBAL);
@@ -694,21 +730,8 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
     thread = container_of(rb, struct thread_node, rb_node);
     if (slot->nr_children)
         slot->nr_children--;
-    has_more = clutch_refresh_group_key_locked(slot);
-    slot->seq++;
-    if (has_more) {
-        next_snapshot.key.cluster_id = slot->cluster_id;
-        next_snapshot.key.tgid = slot->tgid;
-        next_snapshot.bucket_id = slot->bucket_id;
-        next_snapshot.nr_children = slot->nr_children;
-        next_snapshot.dispatch_cpu = slot->dispatch_cpu;
-        next_snapshot.vruntime = slot->vruntime;
-        next_snapshot.seq = slot->seq;
-    }
+    clutch_refresh_group_key_locked(slot);
     bpf_spin_unlock(&slot->lock);
-
-    if (has_more)
-        clutch_requeue_group(bucket, &next_snapshot);
 
     bpf_obj_drop(group);
 
@@ -722,6 +745,10 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
 }
 
 SEC("struct_ops/stopping")
+/* 任务停止运行时的回调。
+ * 这里根据本次实际运行时间累加 vruntime，清理 CPU 记账状态；
+ * 如果任务仍然可运行，则重新放回 clutch 队列。
+ */
 int BPF_PROG(clutch_stopping, struct task_struct *p, bool runnable)
 {
     struct run_accounting *acct;
@@ -762,6 +789,9 @@ int BPF_PROG(clutch_stopping, struct task_struct *p, bool runnable)
 }
 
 SEC("struct_ops/enable")
+/* 调度器启用时的初始化回调。
+ * 当前只打印一条日志，方便确认 BPF 调度器已成功加载。
+ */
 int BPF_PROG(clutch_enable)
 {
     bpf_printk("Per-cluster bucket/group/thread CFS skeleton enabled");

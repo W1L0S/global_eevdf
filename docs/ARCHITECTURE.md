@@ -27,11 +27,11 @@
 第二层现在拆成两个对象：
 
 - `struct group_ref`
-  作为 bucket 内线程组红黑树节点，是线程组状态的排序快照。
+  作为 bucket 内线程组红黑树节点，是“可消费调度令牌”。
 - `struct group_slot`
   作为 `(cluster_id, tgid)` 对应的持久化状态，内部保存该线程组下的线程红黑树。
 
-`group_nodes` 这个 HASH map 按 `(cluster_id, tgid)` 保存 `group_slot`。bucket 内真正参与二层排序的是 `group_ref` 快照，而第三层线程树放在对应的 `group_slot` 里。
+`group_nodes` 这个 HASH map 按 `(cluster_id, tgid)` 保存 `group_slot`。bucket 内真正参与二层排序的是 `group_ref` 令牌，而第三层线程树放在对应的 `group_slot` 里。
 
 ### 2.3 第三层：线程节点
 
@@ -53,7 +53,7 @@
 - `tgid / cluster_id / bucket_id`
   标记所属线程组与当前 bucket。
 - `nr_children / dispatch_cpu / vruntime / seq`
-  缓存当前线程组的关键调度字段和快照版本。
+  缓存当前线程组的关键调度字段；`seq` 用于区分同组的多个并发令牌。
 
 ### 3.2 `struct group_slot`
 
@@ -66,7 +66,7 @@
 - `tgid / cluster_id / bucket_id`
   标记所属线程组与 cluster / bucket。
 - `nr_children / dispatch_cpu / vruntime / seq`
-  记录当前线程组的聚合调度状态和当前版本。
+  记录当前线程组的聚合调度状态；`seq` 作为令牌分配计数器。
 
 ### 3.3 `struct thread_node`
 
@@ -143,8 +143,9 @@
 2. 从两个顶层 bucket 中轮流挑一个非空 bucket。
 3. 从该 bucket 的红黑树取出 `vruntime` 最小的线程组节点。
 4. 从线程组节点内部的红黑树取出 `vruntime` 最小的线程节点。
-5. 若线程组还有剩余线程，则按新的最小线程 `vruntime` 重新挂回 bucket 红黑树。
-6. 将线程派发到它记录的 `home_cpu`，若不合法则回退到当前 CPU。
+5. 将线程派发到它记录的 `home_cpu`，若不合法则回退到当前 CPU。
+
+这里的关键变化是：enqueue 时按线程数量生成 `group_ref` 令牌，因此同一线程组在 bucket 里可同时存在多个令牌。多个 CPU 并发 dispatch 时可以并发消费这些令牌，各自从同一个 `group_slot` 里取不同线程，不再被“单组单令牌”串行化。
 
 这一版 dispatch 的顶层仍然只是“两桶轮转”，但二层和三层已经改成单棵红黑树的 CFS 风格选择：
 
@@ -176,7 +177,7 @@
 为了满足 BPF `rbtree` 的锁约束，当前用了三类锁：
 
 - `cluster_ctx.lock`
-  保护 cluster 级别的 cursor 和 group stash 安装过程。
+  保护 cluster 级别的 bucket 轮转游标。
 - `clutch_bucket.lock`
   保护顶层 bucket 红黑树。
 - `group_slot.lock`
@@ -185,7 +186,7 @@
 实现上避免了嵌套持锁，所有跨层操作都拆成分阶段处理：
 
 - 先改 group 内部线程树
-- 再按需要把 group 挂回 bucket 树
+- enqueue 时再把对应数量的 group 令牌挂到 bucket 树
 
 这样虽然现在不是最强一致的实现，但更容易通过 BPF verifier，也更适合做第一阶段架构重构。
 
