@@ -7,6 +7,8 @@
 - 每个 cluster 有 2 个顶层 bucket
 - bucket 里放线程组
 - 线程组里放线程
+- 统一调度实体为 `clutch_se`
+- bucket 维护 `group_cfs_rq`，group 维护 `thread_cfs_rq`
 - 二层和三层目前都按最小 `vruntime` 做 CFS 风格排序
 
 ## 项目做了什么
@@ -46,10 +48,10 @@ sudo ./build/loader_clutch
 
 ## 调度流程速览
 
-1. 任务入队时根据 `home_cpu` 找到所属 cluster，再由 `tgid & 1` 进入其中一个 bucket。
-2. 线程先插入所属线程组的红黑树，并按线程粒度生成可消费的 group 令牌挂入 bucket 红黑树。
-3. dispatch 时先在 cluster 的两个 bucket 之间轮转，再消费一个令牌并从对应 group 里取最小 `vruntime` 的 thread。
-4. 任务停机时按运行时间更新 `vruntime`，若仍 runnable 则重新入队。
+1. 线程入队时根据 `home_cpu` 找到所属 cluster，再由 `pid` 计算 bucket。
+2. 线程实体 `thread_se` 先插入所属组的 `thread_cfs_rq`，再同步生成组实体 `group_se` 挂入 bucket 的 `group_cfs_rq`。
+3. dispatch 时先在 cluster 的两个 bucket 之间轮转，再从 `group_cfs_rq` 和 `thread_cfs_rq` 各做一次最小 `vruntime` 选择。
+4. 线程停机时按运行时间更新 `vruntime`，若仍 runnable 则重新入队。
 
 ## 文档入口
 

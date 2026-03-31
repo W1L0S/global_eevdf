@@ -1,203 +1,160 @@
 # Per-Cluster Clutch/CFS 架构说明
 
-当前版本不再使用单一全局 `ready/future` 双树，而是先落一个借鉴 Clutch 思路的三层骨架。当前二层和三层都先按 CFS 风格的 `vruntime` 排序，重点是把层次、节点关系和 `per-cluster` 状态固定下来，后续再逐步补 bucket 分类、选核和抢占。
+当前实现采用 per-cluster 三层结构，并使用统一调度实体 `clutch_se` 表达可参与排序的对象。
+
+- bucket 层维护 group 实体树：`group_cfs_rq`
+- group 层维护 thread 实体树：`thread_cfs_rq`
+- 两层都按最小 `vruntime` 做 CFS 风格选择
 
 ## 1. 设计目标
 
-- 从“全局单队列”切到“per-cluster 分层队列”。
-- 先用最小 `vruntime` 驱动二层和三层排序。
-- 第一阶段先把整体容器关系和调度路径固定下来。
-- `select_cpu`、复杂 cluster 放置、抢占逻辑暂时继续保持最简路径。
+- 从全局单队列切换到 per-cluster 分层队列。
+- 固定 `cluster -> bucket -> group -> thread` 的调度路径。
+- 先稳定数据结构与并发模型，再逐步补齐 QoS/迁移/抢占策略。
 
 ## 2. 三层结构
 
-### 2.1 第一层：cluster 顶层 bucket
+### 2.1 第一层：cluster / bucket
 
-`cluster_ctxs` 是一个 ARRAY map，每个 cluster 对应一个轻量的 `struct cluster_ctx`，当前只保存 bucket 轮转游标。
+- `cluster_ctx_map` 记录 cluster 级轮转状态（`next_bucket`）。
+- `bucket_ctx_map` 保存每个 bucket 的上下文。
+- 每个 bucket 内部维护 `group_cfs_rq`（group 调度实体红黑树）。
 
-真正的 bucket 容器放在独立的 `bucket_ctxs` ARRAY map 里。每个 cluster 里仍然有两个顶层 bucket：
+### 2.2 第二层：group
 
-- `buckets[0]`
-- `buckets[1]`
+- `group_ctx_map` 以 `(cluster_id, group_id)` 为 key 保存 `group_ctx`。
+- `group_ctx` 是组的持久化状态，内部有 `thread_cfs_rq`。
+- bucket 中参与排序的是短生命周期 `group_se`（类型为 `clutch_se`）。
 
-目前 bucket 只是承载线程组的容器，还没有真实的 Clutch bucket 分类策略。当前实现先用 `tgid & 1` 把线程组稳定地映射到两个桶里，后续可以替换成交互性、负载等级、QoS 或其他策略。
+### 2.3 第三层：thread
 
-### 2.2 第二层：线程组节点
-
-第二层现在拆成两个对象：
-
-- `struct group_ref`
-  作为 bucket 内线程组红黑树节点，是“可消费调度令牌”。
-- `struct group_slot`
-  作为 `(cluster_id, tgid)` 对应的持久化状态，内部保存该线程组下的线程红黑树。
-
-`group_nodes` 这个 HASH map 按 `(cluster_id, tgid)` 保存 `group_slot`。bucket 内真正参与二层排序的是 `group_ref` 令牌，而第三层线程树放在对应的 `group_slot` 里。
-
-### 2.3 第三层：线程节点
-
-第三层节点使用 `struct thread_node`，语义是“线程节点”：
-
-- `pid` / `tgid` 表示线程身份
-- `dispatch_cpu` 记录当前这个线程的暂定 home CPU
-
-线程节点是短生命周期对象：enqueue 时创建，dispatch 取出后释放。
+- thread 入队时创建 `thread_se`（类型为 `clutch_se`）。
+- thread_se 按 `vruntime` 插入所属 group 的 `thread_cfs_rq`。
+- dispatch 消费 thread_se 后释放对象。
 
 ## 3. 关键数据结构
 
-### 3.1 `struct group_ref`
+### 3.1 `struct clutch_se`
 
-二层 bucket 内线程组节点包含：
+统一调度实体，既可表示 group_se，也可表示 thread_se，核心字段：
 
-- `rb_node`
-  作为 bucket 内线程组红黑树节点。
-- `tgid / cluster_id / bucket_id`
-  标记所属线程组与当前 bucket。
-- `nr_children / dispatch_cpu / vruntime / seq`
-  缓存当前线程组的关键调度字段；`seq` 用于区分同组的多个并发令牌。
+- `rb_node`：红黑树节点
+- `pid / tgid`：对象标识
+- `cluster_id / bucket_id / dispatch_cpu`：拓扑与目标 CPU 信息
+- `vruntime`：排序主键
+- `wmult / slice_ns`：线程运行折算与时间片信息（group_se 不使用时保持默认值）
+- `nr_children / seq`：组实体令牌信息
 
-### 3.2 `struct group_slot`
+### 3.2 `struct group_ctx`
 
-线程组持久化状态包含：
+组级持久化状态：
 
-- `children`
-  线程组内部线程树，元素类型为 `thread_node`。
-- `lock`
-  保护组内线程红黑树。
-- `tgid / cluster_id / bucket_id`
-  标记所属线程组与 cluster / bucket。
-- `nr_children / dispatch_cpu / vruntime / seq`
-  记录当前线程组的聚合调度状态；`seq` 作为令牌分配计数器。
+- `thread_cfs_rq`：组内线程实体树
+- `nr_children / vruntime / dispatch_cpu / seq`：组聚合状态
+- `lock`：保护组内树与聚合字段
 
-### 3.3 `struct thread_node`
+### 3.3 `struct bucket_ctx`
 
-三层线程节点包含：
+bucket 级状态：
 
-- `rb_node`
-  作为 group 内线程红黑树节点。
-- `pid / tgid`
-  标记线程身份。
-- `cluster_id / bucket_id / dispatch_cpu`
-  标记所属 cluster / bucket 与暂定目标 CPU。
-- `vruntime / wmult / slice_ns`
-  当前排序直接使用 `vruntime`，`wmult` 用于运行后折算时间，`slice_ns` 用于 dispatch 时给时间片。
+- `group_cfs_rq`：bucket 内组实体树
+- `nr_groups`：当前组实体数量
+- `lock`：保护 bucket 树
 
-### 3.4 `struct cluster_ctx`
+### 3.4 `struct thread_ctx`
 
-每个 cluster 拥有：
-
-- `next_bucket`
-  dispatch 时用于在两个 bucket 之间轮转起点。
-
-### 3.5 `struct clutch_bucket`
-
-每个 bucket 单独作为 `bucket_ctxs` 的 value，包含：
-
-- `groups`
-  顶层线程组快照红黑树。
-- `lock`
-  保护 bucket 红黑树。
-- `nr_groups`
-  当前 bucket 内线程组快照数量。
-
-### 3.6 `task_ctx_stor`
-
-任务长期状态仍然放在 TASK_STORAGE：
+线程长期状态（TASK_STORAGE）：
 
 - `vruntime`
 - `last_run_ns`
 - `cluster_id / bucket_id / home_cpu`
+- `is_running`
 
-### 3.7 `cpu_run_account`
+### 3.5 `struct cpu_run_state`
 
-当前版本保留了每 CPU 的运行态记录，但语义简化为：
+每 CPU 运行态记账：
 
-- 当前任务的 `wmult`
-- 所属 cluster / bucket
+- `wmult`
+- `cluster_id / bucket_id`
+- `pid / tgid`
 - `home_cpu`
+- `valid`
 
-它只用于 `stopping` 时把运行时间折算回 `vruntime`。
+## 4. BPF Maps 设计
 
-## 4. 当前调度路径
+### 4.1 `cluster_ctx_map`
 
-### 4.1 enqueue
+- 类型：`BPF_MAP_TYPE_ARRAY`
+- key：`u32 cluster_id`
+- value：`struct cluster_ctx`
+- 用途：cluster 级 bucket 轮转状态
 
-入队时执行：
+### 4.2 `bucket_ctx_map`
 
-1. 根据任务允许 CPU 集和当前 CPU，挑一个临时 `home_cpu`。
-2. 由 `home_cpu` 映射出 `cluster_id`。
-3. 由 `tgid & 1` 得到 `bucket_id`。
-4. 创建三层线程节点。
-5. 取出或创建对应的线程组节点。
-6. 把线程节点按 `vruntime` 插入线程组内部的红黑树。
-7. 线程组节点按当前最小线程的 `vruntime` 挂到所属 bucket 的红黑树。
+- 类型：`BPF_MAP_TYPE_ARRAY`
+- key：`u32 bucket_index`
+- value：`struct bucket_ctx`
+- 用途：保存 `group_cfs_rq` 与 bucket 统计状态
 
-因此，入队路径现在遵循：
+### 4.3 `group_ctx_map`
 
-`cluster -> bucket -> thread-group -> thread`
+- 类型：`BPF_MAP_TYPE_HASH`
+- key：`struct group_key { u32 cluster_id; u32 group_id; }`
+- value：`struct group_ctx`
+- 用途：组级持久化上下文与 `thread_cfs_rq`
 
-### 4.2 dispatch
+### 4.4 `thread_ctx_map`
 
-派发时执行：
+- 类型：`BPF_MAP_TYPE_TASK_STORAGE`
+- key：`task_struct *`（由 task storage 机制管理）
+- value：`struct thread_ctx`
+- 用途：线程长期状态与线程到 cluster/group/bucket 映射
+
+### 4.5 `cpu_run_state_map`
+
+- 类型：`BPF_MAP_TYPE_ARRAY`
+- key：`u32 cpu_id`
+- value：`struct cpu_run_state`
+- 用途：每 CPU 当前运行线程的暂态记账
+
+## 5. 调度路径
+
+### 5.1 enqueue
+
+1. 选择 `home_cpu`，映射得到 `cluster_id`。
+2. 计算 `bucket_id`。
+3. 取得或创建 `group_ctx`。
+4. 创建 thread_se，插入 `thread_cfs_rq`。
+5. 同步生成 group_se，插入 bucket 的 `group_cfs_rq`。
+
+### 5.2 dispatch
 
 1. 根据当前 CPU 找到所属 cluster。
-2. 从两个顶层 bucket 中轮流挑一个非空 bucket。
-3. 从该 bucket 的红黑树取出 `vruntime` 最小的线程组节点。
-4. 从线程组节点内部的红黑树取出 `vruntime` 最小的线程节点。
-5. 将线程派发到它记录的 `home_cpu`，若不合法则回退到当前 CPU。
+2. 在 cluster 内做 bucket 轮转，挑选非空 bucket。
+3. 从 `group_cfs_rq` 取最小 `vruntime` 的 group_se。
+4. 通过 group_key 找到对应 `group_ctx`。
+5. 从 `thread_cfs_rq` 取最小 `vruntime` 的 thread_se。
+6. 将 thread_se dispatch 到目标 CPU（非法则回退）。
 
-这里的关键变化是：enqueue 时按线程数量生成 `group_ref` 令牌，因此同一线程组在 bucket 里可同时存在多个令牌。多个 CPU 并发 dispatch 时可以并发消费这些令牌，各自从同一个 `group_slot` 里取不同线程，不再被“单组单令牌”串行化。
+### 5.3 stopping
 
-这一版 dispatch 的顶层仍然只是“两桶轮转”，但二层和三层已经改成单棵红黑树的 CFS 风格选择：
+1. 根据 `delta_ns * wmult` 折算并累加线程 `vruntime`。
+2. 清理 `cpu_run_state_map` 对应槽位。
+3. 若仍 runnable，则重新执行 enqueue。
 
-- bucket 之间做简单轮转
-- bucket 内线程组按最小 `vruntime` 选择
-- 线程组内线程按最小 `vruntime` 选择
+## 6. 并发与锁
 
-### 4.3 stopping
+- `cluster_ctx.lock`：保护 bucket 轮转游标。
+- `bucket_ctx.lock`：保护 `group_cfs_rq`。
+- `group_ctx.lock`：保护 `thread_cfs_rq` 及组聚合字段。
 
-任务停止运行时：
+实现保持分阶段操作，避免跨层嵌套持锁，提升 verifier 通过率与可维护性。
 
-1. 用 `delta_ns * wmult` 更新 `vruntime`。
-2. 清理当前 CPU 的运行态记录。
-3. 如果任务仍 runnable，则重新走一次 enqueue，把它重新挂回三层结构。
+## 7. 当前未实现项
 
-## 5. 当前没有实现的部分
-
-这次重构明确没有实现下面这些策略：
-
-- 第一层 bucket 的真实分类逻辑
-- cluster 内更精细的 CPU 选择
+- QoS 驱动的真实 bucket 分类策略
+- 更细粒度的 cluster 内选核策略
 - cluster 间迁移策略
-- 抢占判断和 kick 逻辑
+- 抢占判定与 kick 机制
 
-换句话说，这个版本的目标是先让结构稳定，而不是让策略完整。
-
-## 6. 并发策略
-
-为了满足 BPF `rbtree` 的锁约束，当前用了三类锁：
-
-- `cluster_ctx.lock`
-  保护 cluster 级别的 bucket 轮转游标。
-- `clutch_bucket.lock`
-  保护顶层 bucket 红黑树。
-- `group_slot.lock`
-  保护单个线程组节点内部的线程红黑树。
-
-实现上避免了嵌套持锁，所有跨层操作都拆成分阶段处理：
-
-- 先改 group 内部线程树
-- enqueue 时再把对应数量的 group 令牌挂到 bucket 树
-
-这样虽然现在不是最强一致的实现，但更容易通过 BPF verifier，也更适合做第一阶段架构重构。
-
-## 7. 后续扩展点
-
-后面如果继续往更完整的 Clutch 策略推进，建议按这个顺序补：
-
-1. 把 `bucket_id` 从 `tgid & 1` 替换成真实 bucket 分类。
-2. 在二层和三层分别补上你最终想要的 group/thread 选择逻辑。
-3. 再决定 group key 是直接用最小 thread `vruntime`，还是用更完整的 group 聚合指标。
-4. 用真实拓扑替换当前 `cpus_per_cluster` 的静态 cluster 划分。
-5. 再补 cluster 内选核和抢占。
-
-这样可以保证每一步都只改一层策略，不需要再动三层骨架本身。
+当前版本目标是稳定层次结构与命名语义，为后续策略扩展提供基座。
