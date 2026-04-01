@@ -9,8 +9,10 @@
 #define MAX_CPUS                 256
 #define MAX_CLUSTERS             MAX_CPUS
 #define MAX_GROUPS               16384
-#define NR_CLUTCH_BUCKETS        2
+#define MAX_CLUTCH_BUCKETS       8
 #define DEFAULT_CPUS_PER_CLUSTER 4
+#define DEFAULT_CLUTCH_BUCKETS   5
+#define CPU_RUN_STATE_KEY        0
 #include "../../tools/sched_ext/include/scx/common.bpf.h"
 
 static const int clutch_prio_to_weight[40] = {
@@ -38,8 +40,18 @@ char _license[] SEC("license") = "GPL";
 
 const volatile u32 nr_cpu_ids = MAX_CPUS;
 const volatile u32 cpus_per_cluster = DEFAULT_CPUS_PER_CLUSTER;
+const volatile u32 nr_clutch_buckets = DEFAULT_CLUTCH_BUCKETS;
 const volatile u32 cpu_cluster_map[MAX_CPUS];
 const volatile u32 cpu_cluster_map_ready;
+const volatile u64 clutch_bucket_ddl_ns[MAX_CLUTCH_BUCKETS];
+
+static const u64 clutch_default_bucket_ddl_ns[MAX_CLUTCH_BUCKETS] = {
+    0ULL,        /* FG */
+    37500000ULL, /* IN: 37.5ms */
+    75000000ULL, /* DF: 75ms */
+    150000000ULL,/* UT: 150ms */
+    250000000ULL,/* BG: 250ms */
+};
 
 struct clutch_se {
     struct bpf_rb_node rb_node;
@@ -86,9 +98,11 @@ struct group_key {
 struct thread_ctx {
     u64 vruntime;
     u64 last_run_ns;
+    u64 wmult;
     u32 cluster_id;
     u32 bucket_id;
-    s32 home_cpu;
+    s32 preferred_cpu;
+    s32 run_cpu;
     bool is_running;
 };
 
@@ -98,7 +112,7 @@ struct cpu_run_state {
     u32 bucket_id;
     s32 pid;
     s32 tgid;
-    s32 home_cpu;
+    s32 run_cpu;
     u32 valid;
 };
 
@@ -111,7 +125,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_CLUSTERS * NR_CLUTCH_BUCKETS);
+    __uint(max_entries, MAX_CLUSTERS * MAX_CLUTCH_BUCKETS);
     __type(key, u32);
     __type(value, struct bucket_ctx);
 } bucket_ctx_map SEC(".maps");
@@ -132,8 +146,8 @@ struct {
 } thread_ctx_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_CPUS);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct cpu_run_state);
 } cpu_run_state_map SEC(".maps");
@@ -199,6 +213,36 @@ static __always_inline u32 clutch_cpus_per_cluster(void)
     return width;
 }
 
+/* 返回当前启用的顶层 bucket 数。
+ * 用户态可在 [1, MAX_CLUTCH_BUCKETS] 范围内配置，超界时会回退到默认值。
+ */
+static __always_inline u32 clutch_nr_buckets(void)
+{
+    u32 nr = nr_clutch_buckets;
+
+    if (!nr || nr > MAX_CLUTCH_BUCKETS)
+        nr = DEFAULT_CLUTCH_BUCKETS;
+
+    return nr;
+}
+
+/* 读取指定 bucket 的 deadline 配置；未配置时按 XNU clutch root bucket WCEL 默认值回退。 */
+static __always_inline u64 clutch_bucket_deadline_ns(u32 bucket_id)
+{
+    u64 ddl;
+
+    if (bucket_id >= clutch_nr_buckets())
+        bucket_id = 0;
+
+    ddl = clutch_bucket_ddl_ns[bucket_id];
+    if (!ddl && bucket_id < DEFAULT_CLUTCH_BUCKETS)
+        ddl = clutch_default_bucket_ddl_ns[bucket_id];
+    if (!ddl)
+        ddl = clutch_default_bucket_ddl_ns[DEFAULT_CLUTCH_BUCKETS - 1];
+
+    return ddl;
+}
+
 /* 把 CPU 编号映射到 cluster 编号。
  * 如果用户态已经写入真实拓扑映射，则直接按真实 cluster 归类；
  * 否则退回到按固定 cluster 宽度切分的旧逻辑。
@@ -229,7 +273,7 @@ static __always_inline u32 clutch_cpu_to_cluster(s32 cpu)
 /* 为任务挑选一个“归属 CPU”。
  * 优先使用任务当前 CPU；若不可用，再从允许的 cpumask 中任意选一个。
  */
-static __always_inline s32 clutch_pick_home_cpu(struct task_struct *p)
+static __always_inline s32 clutch_pick_preferred_cpu(struct task_struct *p)
 {
     s32 cpu = scx_bpf_task_cpu(p);
 
@@ -244,10 +288,34 @@ static __always_inline s32 clutch_pick_home_cpu(struct task_struct *p)
     return 0;
 }
 
-/* 根据 pid 计算 bucket 编号，把不同线程散列到不同 bucket。 */
+/* 为 dispatch 选择一个合法目标 CPU。
+ * 优先使用线程的 preferred_cpu，其次尝试当前请求 dispatch 的 CPU，
+ * 最后从允许的 cpumask 中挑任意合法 CPU；失败则返回 -1。
+ */
+static __always_inline s32 clutch_pick_dispatch_cpu(struct task_struct *p,
+                                                    s32 preferred_cpu,
+                                                    s32 dispatch_cpu)
+{
+    if (preferred_cpu >= 0 && preferred_cpu < MAX_CPUS &&
+        bpf_cpumask_test_cpu(preferred_cpu, p->cpus_ptr))
+        return preferred_cpu;
+
+    if (dispatch_cpu >= 0 && dispatch_cpu < MAX_CPUS &&
+        bpf_cpumask_test_cpu(dispatch_cpu, p->cpus_ptr))
+        return dispatch_cpu;
+
+    preferred_cpu = clutch_pick_preferred_cpu(p);
+    if (preferred_cpu >= 0 && preferred_cpu < MAX_CPUS &&
+        bpf_cpumask_test_cpu(preferred_cpu, p->cpus_ptr))
+        return preferred_cpu;
+
+    return -1;
+}
+
+/* 先保留简单映射：按 pid 把线程散列到当前活跃 bucket。 */
 static __always_inline u32 clutch_bucket_id(s32 pid)
 {
-    return ((u32)pid) & (NR_CLUTCH_BUCKETS - 1);
+    return ((u32)pid) % clutch_nr_buckets();
 }
 
 /* 获取指定 cluster 的上下文对象，用于记录轮转到哪个 bucket。 */
@@ -264,10 +332,10 @@ static __always_inline struct bucket_ctx *clutch_bucket_ctx(u32 cluster_id, u32 
 {
     u32 idx;
 
-    if (cluster_id >= MAX_CLUSTERS || bucket_id >= NR_CLUTCH_BUCKETS)
+    if (cluster_id >= MAX_CLUSTERS || bucket_id >= clutch_nr_buckets())
         return NULL;
 
-    idx = cluster_id * NR_CLUTCH_BUCKETS + bucket_id;
+    idx = cluster_id * MAX_CLUTCH_BUCKETS + bucket_id;
     return bpf_map_lookup_elem(&bucket_ctx_map, &idx);
 }
 
@@ -370,7 +438,7 @@ clutch_alloc_group_se(const struct group_key *key, u32 bucket_id)
  */
 static __always_inline struct clutch_se *
 clutch_alloc_thread_se(struct task_struct *p, struct thread_ctx *tctx,
-                       u32 cluster_id, u32 bucket_id, s32 home_cpu)
+                       u32 cluster_id, u32 bucket_id, s32 preferred_cpu)
 {
     struct clutch_se *thread_se;
     u64 wmult, slice_ns;
@@ -393,14 +461,17 @@ clutch_alloc_thread_se(struct task_struct *p, struct thread_ctx *tctx,
     thread_se->tgid = p->tgid;
     thread_se->cluster_id = cluster_id;
     thread_se->bucket_id = bucket_id;
-    thread_se->dispatch_cpu = home_cpu;
+    thread_se->dispatch_cpu = preferred_cpu;
     thread_se->wmult = wmult;
     thread_se->slice_ns = slice_ns;
     thread_se->vruntime = tctx->vruntime;
 
+    tctx->wmult = wmult;
     tctx->cluster_id = cluster_id;
     tctx->bucket_id = bucket_id;
-    tctx->home_cpu = home_cpu;
+    tctx->preferred_cpu = preferred_cpu;
+    if (!tctx->is_running)
+        tctx->run_cpu = -1;
 
     return thread_se;
 }
@@ -465,7 +536,7 @@ static __always_inline int clutch_queue_thread(struct group_ctx *slot,
 }
 
 /* 把一个任务接入 clutch 调度结构。
- * 过程包括：获取任务私有上下文、确定 home cpu/cluster/bucket、找到线程槽位、
+ * 过程包括：获取任务私有上下文、确定 preferred cpu/cluster/bucket、找到线程槽位、
  * 创建线程节点，并把它加入线程树和 bucket 树。
  */
 static __always_inline int clutch_enqueue_thread(struct task_struct *p)
@@ -474,7 +545,7 @@ static __always_inline int clutch_enqueue_thread(struct task_struct *p)
     struct clutch_se *thread_se;
     struct group_ctx *slot;
     struct group_key key;
-    s32 home_cpu;
+    s32 preferred_cpu;
     u32 cluster_id, bucket_id;
 
     tctx = bpf_task_storage_get(&thread_ctx_map, p, 0,
@@ -482,8 +553,8 @@ static __always_inline int clutch_enqueue_thread(struct task_struct *p)
     if (!tctx)
         return -1;
 
-    home_cpu = clutch_pick_home_cpu(p);
-    cluster_id = clutch_cpu_to_cluster(home_cpu);
+    preferred_cpu = clutch_pick_preferred_cpu(p);
+    cluster_id = clutch_cpu_to_cluster(preferred_cpu);
     bucket_id = clutch_bucket_id(p->pid);
 
     key.cluster_id = cluster_id;
@@ -497,7 +568,7 @@ static __always_inline int clutch_enqueue_thread(struct task_struct *p)
     slot->pid = p->pid;
     slot->bucket_id = bucket_id;
 
-    thread_se = clutch_alloc_thread_se(p, tctx, cluster_id, bucket_id, home_cpu);
+    thread_se = clutch_alloc_thread_se(p, tctx, cluster_id, bucket_id, preferred_cpu);
     if (!thread_se)
         return -1;
 
@@ -508,64 +579,72 @@ static __always_inline int clutch_enqueue_thread(struct task_struct *p)
 }
 
 /* 把选中的线程真正 dispatch 到某个 CPU。
- * 同时记录本次运行需要的记账信息，供 stopping 回调更新 vruntime。
+ * dispatch 只负责把任务放进目标 DSQ；真正开始运行的时点由 running 回调记录。
  */
 static __noinline int clutch_dispatch_thread(struct clutch_se *thread_se, s32 cpu)
 {
     struct task_struct *p;
-    struct cpu_run_state *acct;
     struct thread_ctx *tctx;
-    u32 cpu_id;
     s32 target_cpu;
-
-    target_cpu = thread_se->dispatch_cpu;
-    if (target_cpu < 0 || target_cpu >= MAX_CPUS)
-        target_cpu = cpu;
 
     p = bpf_task_from_pid(thread_se->pid);
     if (!p)
         return -1;
 
-    if (!bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr))
-        target_cpu = cpu;
+    target_cpu = clutch_pick_dispatch_cpu(p, thread_se->dispatch_cpu, cpu);
 
-    if (!bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr))
-        target_cpu = clutch_pick_home_cpu(p);
-
-    if (target_cpu < 0 || target_cpu >= MAX_CPUS ||
-        !bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr))
-        target_cpu = cpu;
-
-    cpu_id = (u32)target_cpu;
-    acct = bpf_map_lookup_elem(&cpu_run_state_map, &cpu_id);
     tctx = bpf_task_storage_get(&thread_ctx_map, p, 0, 0);
 
-    if (acct) {
-        acct->wmult = thread_se->wmult;
-        acct->cluster_id = thread_se->cluster_id;
-        acct->bucket_id = thread_se->bucket_id;
-        acct->pid = thread_se->pid;
-        acct->tgid = thread_se->tgid;
-        acct->home_cpu = thread_se->dispatch_cpu;
-        acct->valid = 1;
-    }
-
     if (tctx) {
-        tctx->last_run_ns = bpf_ktime_get_ns();
         tctx->cluster_id = thread_se->cluster_id;
         tctx->bucket_id = thread_se->bucket_id;
-        tctx->home_cpu = thread_se->dispatch_cpu;
-        tctx->is_running = true;
+        tctx->preferred_cpu = thread_se->dispatch_cpu;
+        tctx->wmult = thread_se->wmult;
     }
 
     scx_bpf_dispatch(p,
-                     target_cpu == cpu ? SCX_DSQ_LOCAL : (SCX_DSQ_LOCAL_ON | target_cpu),
+                     target_cpu < 0 ? SCX_DSQ_GLOBAL :
+                     (target_cpu == cpu ? SCX_DSQ_LOCAL : (SCX_DSQ_LOCAL_ON | target_cpu)),
                      thread_se->slice_ns ?: DEFAULT_SLICE_NS,
                      0);
 
     bpf_task_release(p);
     bpf_obj_drop(thread_se);
     return 0;
+}
+
+SEC("struct_ops/running")
+/* 任务真正开始在某个 CPU 上执行时的回调。
+ * 这里把本 CPU 的本地运行快照写入 percpu map，并记录运行起始时间。
+ * 跨回调的权威记账状态保存在 thread_ctx 中，避免依赖 stopping 的触发 CPU。
+ */
+void BPF_PROG(clutch_running, struct task_struct *p)
+{
+    struct cpu_run_state *acct;
+    struct thread_ctx *tctx;
+    u32 key = CPU_RUN_STATE_KEY;
+    s32 cpu;
+
+    cpu = scx_bpf_task_cpu(p);
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+
+    acct = bpf_map_lookup_elem(&cpu_run_state_map, &key);
+    tctx = bpf_task_storage_get(&thread_ctx_map, p, 0, 0);
+    if (!acct || !tctx)
+        return;
+
+    acct->wmult = tctx->wmult;
+    acct->cluster_id = tctx->cluster_id;
+    acct->bucket_id = tctx->bucket_id;
+    acct->pid = p->pid;
+    acct->tgid = p->tgid;
+    acct->run_cpu = cpu;
+    acct->valid = 1;
+
+    tctx->last_run_ns = bpf_ktime_get_ns();
+    tctx->run_cpu = cpu;
+    tctx->is_running = true;
 }
 
 /* 从 bucket 中取出当前最应该运行的组，也就是红黑树最左侧节点。 */
@@ -596,35 +675,72 @@ clutch_pop_group_from_bucket(struct bucket_ctx *bucket)
     return NULL;
 }
 
+/* 检查 bucket 当前是否非空。
+ * 这里只做短临界区探测，真正取元素仍由 pop 路径负责。
+ */
+static __always_inline bool clutch_bucket_has_groups(struct bucket_ctx *bucket)
+{
+    bool has_groups = false;
+
+    if (!bucket)
+        return false;
+
+    bpf_spin_lock(&bucket->lock);
+    has_groups = bucket->nr_groups > 0;
+    bpf_spin_unlock(&bucket->lock);
+
+    return has_groups;
+}
+
+/* 在 cluster 内按 bucket deadline 选择下一个 bucket。
+ * 多个 bucket 的 deadline 相同时，从 cursor 开始顺序扫描打散热点。
+ */
+static __always_inline s32 clutch_pick_bucket_id(struct cluster_ctx *cluster, u32 cluster_id)
+{
+    u32 nr_buckets = clutch_nr_buckets();
+    u32 start, off;
+    s32 best_bucket = -1;
+    u64 best_ddl = 0;
+
+    bpf_spin_lock(&cluster->lock);
+    start = cluster->next_bucket % nr_buckets;
+    cluster->next_bucket = (start + 1) % nr_buckets;
+    bpf_spin_unlock(&cluster->lock);
+
+    for (off = 0; off < nr_buckets; off++) {
+        struct bucket_ctx *bucket;
+        u32 bucket_id = (start + off) % nr_buckets;
+        u64 ddl;
+
+        bucket = clutch_bucket_ctx(cluster_id, bucket_id);
+        if (!clutch_bucket_has_groups(bucket))
+            continue;
+
+        ddl = clutch_bucket_deadline_ns(bucket_id);
+        if (best_bucket < 0 || ddl < best_ddl) {
+            best_bucket = (s32)bucket_id;
+            best_ddl = ddl;
+        }
+    }
+
+    return best_bucket;
+}
+
 /* 在 cluster 内选择下一个组。
- * 这里在两个 bucket 间轮转，尝试兼顾不同 bucket 中的组。
+ * 顶层 bucket 先按配置的 DDL 执行 EDF 选桶，再从选中的 bucket 弹出 group。
  */
 static __always_inline struct clutch_se *
 clutch_pick_group(struct cluster_ctx *cluster, u32 cluster_id)
 {
     struct bucket_ctx *bucket;
-    struct clutch_se *group_se;
-    u32 start, first_idx, second_idx;
+    s32 bucket_id;
 
-    bpf_spin_lock(&cluster->lock);
-    start = cluster->next_bucket & (NR_CLUTCH_BUCKETS - 1);
-    cluster->next_bucket = (start + 1) & (NR_CLUTCH_BUCKETS - 1);
-    bpf_spin_unlock(&cluster->lock);
+    bucket_id = clutch_pick_bucket_id(cluster, cluster_id);
+    if (bucket_id < 0)
+        return NULL;
 
-    first_idx = start;
-    second_idx = start ^ 1;
-
-    bucket = clutch_bucket_ctx(cluster_id, first_idx);
-    group_se = clutch_pop_group_from_bucket(bucket);
-    if (group_se)
-        return group_se;
-
-    bucket = clutch_bucket_ctx(cluster_id, second_idx);
-    group_se = clutch_pop_group_from_bucket(bucket);
-    if (group_se)
-        return group_se;
-
-    return NULL;
+    bucket = clutch_bucket_ctx(cluster_id, (u32)bucket_id);
+    return clutch_pop_group_from_bucket(bucket);
 }
 
 SEC("struct_ops/select_cpu")
@@ -736,44 +852,43 @@ int BPF_PROG(clutch_dispatch, s32 cpu, struct task_struct *prev)
 
 SEC("struct_ops/stopping")
 /* 任务停止运行时的回调。
- * 这里根据本次实际运行时间累加 vruntime，清理 CPU 记账状态；
- * 如果任务仍然可运行，则重新放回 clutch 队列。
+ * 这里根据 thread_ctx 中的权威状态累加 vruntime。
+ * percpu cpu_run_state_map 只作为本 CPU 的运行快照，停止时做最佳努力清理；
+ * 如果任务仍然可运行，则重新放回 clutch 队列；失败时回退到全局 DSQ。
  */
 int BPF_PROG(clutch_stopping, struct task_struct *p, bool runnable)
 {
     struct cpu_run_state *acct;
     struct thread_ctx *tctx;
-    u32 cpu_id;
-    s32 cpu;
+    u32 key = CPU_RUN_STATE_KEY;
 
-    cpu = bpf_get_smp_processor_id();
-    if (cpu < 0 || cpu >= MAX_CPUS)
-        return 0;
-
-    cpu_id = (u32)cpu;
-    acct = bpf_map_lookup_elem(&cpu_run_state_map, &cpu_id);
+    acct = bpf_map_lookup_elem(&cpu_run_state_map, &key);
     tctx = bpf_task_storage_get(&thread_ctx_map, p, 0, 0);
 
-    if (acct && acct->valid && tctx && tctx->last_run_ns) {
+    if (tctx && tctx->is_running && tctx->last_run_ns) {
         u64 now = bpf_ktime_get_ns();
         u64 delta_ns = now - tctx->last_run_ns;
-        u64 delta_v = (delta_ns * NICE_0_LOAD * acct->wmult) >> 32;
+        u64 delta_v = (delta_ns * NICE_0_LOAD * tctx->wmult) >> 32;
 
         tctx->vruntime += delta_v;
+    }
+
+    if (tctx) {
         tctx->last_run_ns = 0;
+        tctx->run_cpu = -1;
         tctx->is_running = false;
     }
 
-    if (acct) {
+    if (acct && acct->pid == p->pid) {
         acct->valid = 0;
         acct->pid = 0;
         acct->tgid = 0;
         acct->wmult = 0;
-        acct->home_cpu = -1;
+        acct->run_cpu = -1;
     }
 
-    if (runnable)
-        clutch_enqueue_thread(p);
+    if (runnable && clutch_enqueue_thread(p))
+        scx_bpf_dispatch(p, SCX_DSQ_GLOBAL, clutch_calculate_slice(p), 0);
 
     return 0;
 }
@@ -793,6 +908,7 @@ struct sched_ext_ops clutch_ops = {
     .select_cpu = (void *)clutch_select_cpu,
     .enqueue    = (void *)clutch_enqueue,
     .dispatch   = (void *)clutch_dispatch,
+    .running    = (void *)clutch_running,
     .stopping   = (void *)clutch_stopping,
     .enable     = (void *)clutch_enable,
     .name       = "global_clutch",

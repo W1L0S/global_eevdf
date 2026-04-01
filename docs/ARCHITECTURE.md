@@ -2,6 +2,7 @@
 
 当前实现采用 per-cluster 三层结构，并使用统一调度实体 `clutch_se` 表达可参与排序的对象。
 
+- 顶层 bucket 先按配置的 DDL 做 EDF 选桶
 - bucket 层维护 group 实体树：`group_cfs_rq`
 - group 层维护 thread 实体树：`thread_cfs_rq`
 - 两层都按最小 `vruntime` 做 CFS 风格选择
@@ -16,9 +17,12 @@
 
 ### 2.1 第一层：cluster / bucket
 
-- `cluster_ctx_map` 记录 cluster 级轮转状态（`next_bucket`）。
+- `cluster_ctx_map` 记录 cluster 级 tie-break 游标（`next_bucket`）。
 - `bucket_ctx_map` 保存每个 bucket 的上下文。
 - 每个 bucket 内部维护 `group_cfs_rq`（group 调度实体红黑树）。
+- 活跃 bucket 数量和每个 bucket 的 DDL 由用户态配置。
+- 默认配置仿照 XNU clutch root buckets：`FG/IN/DF/UT/BG`
+- 默认 DDL 分别为 `0ns / 37.5ms / 75ms / 150ms / 250ms`
 
 ### 2.2 第二层：group
 
@@ -40,7 +44,7 @@
 
 - `rb_node`：红黑树节点
 - `pid / tgid`：对象标识
-- `cluster_id / bucket_id / dispatch_cpu`：拓扑与目标 CPU 信息
+- `cluster_id / bucket_id / dispatch_cpu`：拓扑与偏好目标 CPU 信息
 - `vruntime`：排序主键
 - `wmult / slice_ns`：线程运行折算与时间片信息（group_se 不使用时保持默认值）
 - `nr_children / seq`：组实体令牌信息
@@ -67,17 +71,18 @@ bucket 级状态：
 
 - `vruntime`
 - `last_run_ns`
-- `cluster_id / bucket_id / home_cpu`
+- `wmult`
+- `cluster_id / bucket_id / preferred_cpu / run_cpu`
 - `is_running`
 
 ### 3.5 `struct cpu_run_state`
 
-每 CPU 运行态记账：
+每 CPU 本地运行快照（percpu）：
 
 - `wmult`
 - `cluster_id / bucket_id`
 - `pid / tgid`
-- `home_cpu`
+- `run_cpu`
 - `valid`
 
 ## 4. BPF Maps 设计
@@ -94,7 +99,7 @@ bucket 级状态：
 - 类型：`BPF_MAP_TYPE_ARRAY`
 - key：`u32 bucket_index`
 - value：`struct bucket_ctx`
-- 用途：保存 `group_cfs_rq` 与 bucket 统计状态
+- 用途：保存 `group_cfs_rq` 与 bucket 统计状态；上限为 `MAX_CLUTCH_BUCKETS`
 
 ### 4.3 `group_ctx_map`
 
@@ -112,17 +117,17 @@ bucket 级状态：
 
 ### 4.5 `cpu_run_state_map`
 
-- 类型：`BPF_MAP_TYPE_ARRAY`
-- key：`u32 cpu_id`
+- 类型：`BPF_MAP_TYPE_PERCPU_ARRAY`
+- key：固定为 `0`
 - value：`struct cpu_run_state`
-- 用途：每 CPU 当前运行线程的暂态记账
+- 用途：保存“当前执行该回调的 CPU”本地运行线程快照，不作为跨回调权威记账源
 
 ## 5. 调度路径
 
 ### 5.1 enqueue
 
-1. 选择 `home_cpu`，映射得到 `cluster_id`。
-2. 计算 `bucket_id`。
+1. 选择 `preferred_cpu`，映射得到 `cluster_id`。
+2. 按当前活跃 bucket 数计算 `bucket_id`。
 3. 取得或创建 `group_ctx`。
 4. 创建 thread_se，插入 `thread_cfs_rq`。
 5. 同步生成 group_se，插入 bucket 的 `group_cfs_rq`。
@@ -130,17 +135,24 @@ bucket 级状态：
 ### 5.2 dispatch
 
 1. 根据当前 CPU 找到所属 cluster。
-2. 在 cluster 内做 bucket 轮转，挑选非空 bucket。
+2. 在 cluster 内扫描活跃 bucket，按最小 DDL 做 EDF 选桶。
 3. 从 `group_cfs_rq` 取最小 `vruntime` 的 group_se。
 4. 通过 group_key 找到对应 `group_ctx`。
 5. 从 `thread_cfs_rq` 取最小 `vruntime` 的 thread_se。
-6. 将 thread_se dispatch 到目标 CPU（非法则回退）。
+6. 将 thread_se dispatch 到目标 CPU（非法则回退），仅把任务放进目标 DSQ。
 
-### 5.3 stopping
+### 5.3 running
 
-1. 根据 `delta_ns * wmult` 折算并累加线程 `vruntime`。
-2. 清理 `cpu_run_state_map` 对应槽位。
-3. 若仍 runnable，则重新执行 enqueue。
+1. 任务真正开始执行时，用 `scx_bpf_task_cpu(p)` 取得实际运行 CPU。
+2. 写入当前 CPU 的本地 `cpu_run_state_map[0]` 快照。
+3. 同时在 `thread_ctx` 里记录 `last_run_ns / wmult`，作为跨回调权威记账状态。
+
+### 5.4 stopping
+
+1. 直接使用 `thread_ctx.last_run_ns / thread_ctx.wmult` 计算本次运行的 `vruntime` 增量。
+2. 最佳努力清理当前 CPU 本地 `cpu_run_state_map[0]` 快照。
+3. 清空 `thread_ctx` 的运行态字段。
+4. 若仍 runnable，则重新执行 enqueue。
 
 ## 6. 并发与锁
 

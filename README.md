@@ -4,7 +4,9 @@
 
 当前版本先落一个借鉴 Clutch 思路的三层骨架：
 
-- 每个 cluster 有 2 个顶层 bucket
+- 每个 cluster 有可配置数量的顶层 bucket
+- 顶层 bucket 按配置的 DDL 做 EDF 选桶
+- 默认值仿照 XNU clutch 顶层 root buckets：`FG/IN/DF/UT/BG`
 - bucket 里放线程组
 - 线程组里放线程
 - 统一调度实体为 `clutch_se`
@@ -42,15 +44,21 @@ make
 
 # 3) 运行调度器（前台）
 sudo ./build/loader_clutch
+
+# 默认 bucket 配置：
+# 5 buckets, ddl = 0ns, 37.5ms, 75ms, 150ms, 250ms
+
+# 4) 指定 bucket 数和每桶 DDL（ns）
+sudo ./build/loader_clutch --nr-buckets=4 --bucket-ddl=1000000,2000000,4000000,8000000
 ```
 
 停止方式：`Ctrl+C`。
 
 ## 调度流程速览
 
-1. 线程入队时根据 `home_cpu` 找到所属 cluster，再由 `pid` 计算 bucket。
+1. 线程入队时根据 `preferred_cpu` 找到所属 cluster，再由 `pid` 计算 bucket。
 2. 线程实体 `thread_se` 先插入所属组的 `thread_cfs_rq`，再同步生成组实体 `group_se` 挂入 bucket 的 `group_cfs_rq`。
-3. dispatch 时先在 cluster 的两个 bucket 之间轮转，再从 `group_cfs_rq` 和 `thread_cfs_rq` 各做一次最小 `vruntime` 选择。
+3. dispatch 时先在 cluster 的活跃 buckets 之间按 DDL 做 EDF 选桶，再从 `group_cfs_rq` 和 `thread_cfs_rq` 各做一次最小 `vruntime` 选择。
 4. 线程停机时按运行时间更新 `vruntime`，若仍 runnable 则重新入队。
 
 ## 文档入口

@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 #include <bpf/libbpf.h>
 
 typedef uint32_t u32;
@@ -13,7 +15,17 @@ typedef int32_t  s32;
 typedef int64_t  s64;
 
 #define MAX_CPUS 256
+#define MAX_CLUTCH_BUCKETS 8
 #define CORES_PER_CLUSTER 5
+#define DEFAULT_CLUTCH_BUCKETS 5
+
+static const u64 default_bucket_ddl_ns[MAX_CLUTCH_BUCKETS] = {
+    0ULL,        /* FG */
+    37500000ULL, /* IN: 37.5ms */
+    75000000ULL, /* DF: 75ms */
+    150000000ULL,/* UT: 150ms */
+    250000000ULL,/* BG: 250ms */
+};
 
 #ifdef SKEL_H
 #include SKEL_H
@@ -54,6 +66,11 @@ struct cluster_topology {
     u32 nr_clusters;
     bool ready;
     const char *source_name;
+};
+
+struct bucket_config {
+    u32 nr_buckets;
+    u64 ddl_ns[MAX_CLUTCH_BUCKETS];
 };
 
 static void sig_handler(int sig)
@@ -202,15 +219,115 @@ static void print_cluster_topology(const struct cluster_topology *topo, int nr_p
     }
 }
 
+static void bucket_config_set_defaults(struct bucket_config *cfg)
+{
+    u32 i;
+
+    *cfg = (struct bucket_config){ .nr_buckets = DEFAULT_CLUTCH_BUCKETS };
+    for (i = 0; i < MAX_CLUTCH_BUCKETS; i++)
+        cfg->ddl_ns[i] = default_bucket_ddl_ns[i];
+}
+
+static int parse_u32_arg(const char *arg, u32 *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    errno = 0;
+    parsed = strtoul(arg, &end, 10);
+    if (errno || !end || *end != '\0' || !parsed || parsed > UINT32_MAX)
+        return -EINVAL;
+
+    *value = (u32)parsed;
+    return 0;
+}
+
+static int parse_bucket_ddls(const char *arg, struct bucket_config *cfg)
+{
+    char buf[256];
+    char *token;
+    u32 idx = 0;
+
+    if (strlen(arg) >= sizeof(buf))
+        return -E2BIG;
+
+    strcpy(buf, arg);
+
+    for (token = strtok(buf, ","); token; token = strtok(NULL, ",")) {
+        char *end = NULL;
+        unsigned long long ddl;
+
+        if (idx >= MAX_CLUTCH_BUCKETS)
+            return -E2BIG;
+
+        errno = 0;
+        ddl = strtoull(token, &end, 10);
+        if (errno || !end || *end != '\0' || !ddl)
+            return -EINVAL;
+
+        cfg->ddl_ns[idx++] = (u64)ddl;
+    }
+
+    return idx ? 0 : -EINVAL;
+}
+
+static int parse_bucket_config(int argc, char **argv, struct bucket_config *cfg)
+{
+    int i;
+
+    bucket_config_set_defaults(cfg);
+
+    for (i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--nr-buckets=", 13)) {
+            int err = parse_u32_arg(argv[i] + 13, &cfg->nr_buckets);
+
+            if (err)
+                return err;
+            continue;
+        }
+
+        if (!strncmp(argv[i], "--bucket-ddl=", 13)) {
+            int err = parse_bucket_ddls(argv[i] + 13, cfg);
+
+            if (err)
+                return err;
+            continue;
+        }
+
+        if (!strcmp(argv[i], "--help")) {
+            printf("Usage: %s [--nr-buckets=N] [--bucket-ddl=ns0,ns1,...]\n", argv[0]);
+            printf("  --nr-buckets   active top-level clutch bucket count (1-%d)\n",
+                   MAX_CLUTCH_BUCKETS);
+            printf("  --bucket-ddl   per-bucket deadline in ns, earliest bucket wins\n");
+            return 1;
+        }
+    }
+
+    if (!cfg->nr_buckets || cfg->nr_buckets > MAX_CLUTCH_BUCKETS)
+        return -EINVAL;
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     SKEL_TYPE *skel;
     struct cluster_topology topo;
+    struct bucket_config bucket_cfg;
     int err;
     int nr_possible_cpus;
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+
+    err = parse_bucket_config(argc, argv, &bucket_cfg);
+    if (err) {
+        if (err > 0)
+            return 0;
+
+        fprintf(stderr, "Invalid bucket configuration\n");
+        return 1;
+    }
 
     err = bump_memlock_rlimit();
     if (err) {
@@ -244,10 +361,14 @@ int main(int argc, char **argv)
         skel->rodata->nr_cpu_ids = (u32)nr_possible_cpus;
         skel->rodata->cpus_per_cluster =
             topo.ready && topo.nr_clusters ? (u32)nr_possible_cpus / topo.nr_clusters : 4;
+        skel->rodata->nr_clutch_buckets = bucket_cfg.nr_buckets;
         skel->rodata->cpu_cluster_map_ready = topo.ready ? 1 : 0;
 
         for (cpu = 0; cpu < (u32)nr_possible_cpus && cpu < MAX_CPUS; cpu++)
             skel->rodata->cpu_cluster_map[cpu] = topo.cpu_to_cluster[cpu];
+
+        for (cpu = 0; cpu < MAX_CLUTCH_BUCKETS; cpu++)
+            skel->rodata->clutch_bucket_ddl_ns[cpu] = bucket_cfg.ddl_ns[cpu];
     }
 
     err = SKEL_LOAD(skel);
@@ -271,6 +392,11 @@ int main(int argc, char **argv)
         print_cluster_topology(&topo, nr_possible_cpus);
     else
         printf("  - cluster topology: sysfs unavailable, fallback to fixed-width mapping\n");
+    printf("  - clutch buckets: %u\n", bucket_cfg.nr_buckets);
+    printf("  - bucket deadlines (ns):");
+    for (err = 0; err < (int)bucket_cfg.nr_buckets; err++)
+        printf(" %llu", (unsigned long long)bucket_cfg.ddl_ns[err]);
+    printf("\n");
     printf("  - Watchdog: 5000ms\n");
     printf("Press Ctrl+C to stop and detach.\n");
 
