@@ -21,6 +21,7 @@ tools/
 
 # Claude 临时文件
 .claude/
+.codex
 
 # WSL Zone Identifier
 *:Zone.Identifier
