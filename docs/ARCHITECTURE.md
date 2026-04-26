@@ -11,6 +11,8 @@
 - 全局视角选择任务，而不是每 CPU 独立排队。
 - 严格遵循 EEVDF 的 eligible 条件：$ve \le V$。
 - 维持 Linux 风格 lag 语义：$vlag = V - vruntime$。
+- 在全局公平排序上叠加 CPU 亲和性感知，降低不必要迁移。
+- 根据系统负载和任务交互性自适应调整时间片。
 - 在 BPF 约束下控制复杂度和锁持有时间，避免长循环。
 
 ## 2. 关键状态与数据结构
@@ -24,6 +26,7 @@
 - `V`：系统当前虚拟时间基准。
 - `base_v`、`avg_vruntime_sum`、`avg_load`：就绪任务的加权统计。
 - `run_avg_vruntime_sum`、`run_avg_load`：正在运行任务的加权统计。
+- `nr_ready`、`nr_future`、`nr_running`：用于自适应时间片的全局 runnable 计数。
 
 这组统计量共同决定 $V$ 的推进，而不是靠固定步长累加。
 
@@ -34,7 +37,8 @@
 - `ve`：虚拟可运行时间，等于任务当前 `vruntime`。
 - `vd`：虚拟截止时间，$vd = ve + vslice$。
 - `weight`、`wmult`：权重与其倒数乘子缓存。
-- `slice_ns`：本次分配的物理时间片（当前实现固定 3ms）。
+- `slice_ns`：本次分配的物理时间片（由自适应策略动态给出）。
+- `enqueue_ns`、`last_cpu`、`preferred_cpu`、`preferred_cpu_ts`：用于 Top-K 亲和性感知重排的快照，其中 `preferred_cpu` 只在 TTL 窗口内有效。
 
 ### 2.3 任务长期状态：`task_ctx_stor` (TASK_STORAGE)
 
@@ -42,7 +46,11 @@
 
 - `vruntime`：任务累计虚拟运行时间。
 - `vlag`：任务相对系统基准的偏差，定义为 $V - vruntime$。
-- `saved_vd`、`last_weight`、`last_run_ns`、`is_running`：运行期辅助信息。
+- `saved_vd`、`last_weight`、`last_run_ns`：运行期辅助信息。
+- `run_state`、`run_weight_val`、`run_wmult`：任务绑定的运行态记账快照，显式区分 `IDLE -> DISPATCHED -> RUNNING`。
+- `sched_state_valid`：显式标记该任务是否已经建立过调度状态，避免用 `vruntime == 0` 误判新任务。
+- `last_cpu`、`preferred_cpu`、`last_cpu_ts`、`preferred_cpu_ts`：最近运行位置与默认选核结果；`preferred_cpu` 超过 TTL 后会自动失效。
+- `sleep_start_ns`、`last_sleep_ns`、`interactive_score`：交互性判别与自适应时间片依据。
 
 因为 rbtree 节点会被释放，长期状态必须放到 task storage 才能稳定恢复。
 
@@ -50,9 +58,8 @@
 
 对应 `struct run_accounting`，记录当前 CPU 正在跑的任务统计：
 
-- `weight_val`、`key_val`：从就绪集合迁移到运行集合时用到的统计值。
 - `curr_vd`：当前任务 `vd`，供唤醒抢占比较。
-- `wmult`、`valid`：结算和有效性标记。
+- `valid`：当前 CPU 是否已有可用于抢占比较的正在运行任务。
 
 ## 3. 调度主流程（按时间顺序）
 
@@ -63,7 +70,7 @@
 执行步骤：
 
 1. 根据 `nice` 与 cgroup 权重计算 `weight/wmult`。
-2. 计算 `slice_ns` 与 `vslice`。
+2. 根据全局负载、交互分数和 CPU 亲和性计算自适应 `slice_ns`，再得到 `vslice`。
 3. 恢复任务 `vruntime`：
    - 新任务：直接贴齐当前 $V$。
    - 老任务：使用保存的 `vlag` 按 $vruntime = V - vlag$ 恢复，并做上下界限制。
@@ -82,27 +89,58 @@
 
 1. 若 `ready` 为空且 `future` 非空，必要时推进 $V$ 到 `future` 最小 `ve`。
 2. 将已满足 $ve \le V$ 的 `future` 节点搬运到 `ready`（有循环上限）。
-3. 从 `ready` 取最小 `vd` 节点。
-4. 做 CPU 亲和性检查：
+3. 从 `ready` 逐个抽取最多 `K` 个最早 `vd` 候选（当前实现 `K=4`）。
+   - 每次只在需要时继续抽取下一个候选，而不是无条件一次取满 `K` 个。
+   - 若当前树顶节点的 `vd` 即使拿到最大 bonus 也不可能优于当前最佳候选，则提前停止抽取。
+4. 对候选计算 `score = vd + affinity_penalty - wait_bonus`：
+   - 偏离 `preferred_cpu/last_cpu` 的任务增加迁移惩罚。
+   - `preferred_cpu` 只在最近一次选核或实际运行后的 TTL 窗口内参与打分，避免陈旧亲和性长期主导调度。
+   - 等待较久的任务得到 bonus，避免因亲和性长期饥饿。
+5. 选择 score 最小的候选，并做 CPU 亲和性检查：
    - 本地可运行：走 `SCX_DSQ_LOCAL`。
    - 本地不可运行：走 `SCX_DSQ_LOCAL_ON | target_cpu` 远程派发。
-5. 将任务统计从 ready 集迁移到 running 集，并更新 `cpu_run_account`。
+6. `dispatch` 仅负责把候选放入目标 DSQ，并将任务状态推进到 `DISPATCHED`，保存任务绑定的运行态快照。
 
-结果：系统优先执行“已 eligible 且截止时间最早”的任务，同时兼顾亲和性。
+结果：系统在保持全局 EEVDF 主顺序的同时，用有限候选重排降低跨 CPU 迁移成本，并通过“按需抽取 + 提前停止”减少对 `ready` 树可见性的平均扰动。
 
-### 3.3 停止运行：`eevdf_stopping`
+### 3.3 开始运行：`eevdf_running`
+
+触发时机：任务真正开始在某个 CPU 上执行。
+
+执行步骤：
+
+1. 从 `task_ctx` 读取 dispatch 阶段保存的运行态快照，并将状态从 `DISPATCHED` 推进到 `RUNNING`。
+2. 将任务统计从 ready 集迁移到 running 集。
+3. 记录真实 `last_run_ns`，避免远程派发排队时间被误算进运行时间。
+4. 刷新当前 CPU 的 `curr_vd`，并把实际运行 CPU 回写为新的 `preferred_cpu`，供后续亲和性判断使用。
+
+结果：本地和远程派发共享同一套“实际开始运行后再记账”的模型。
+
+### 3.4 停止运行：`eevdf_stopping`
 
 触发时机：任务被切走（时间片用尽、阻塞、主动让出）。
 
 执行步骤：
 
 1. 依据 `delta_ns` 计算本次虚拟运行增量并累加到 `vruntime`。
-2. 将该任务从 running 集统计中移除，重算 $V$。
+2. 按任务自身保存的运行态快照将其从 running 集统计中移除，重算 $V$。
 3. 保存 `vlag = V - vruntime`，用于下次唤醒恢复。
 4. 清理当前 CPU 的 `run_accounting` 有效位。
-5. 若任务仍 runnable，则立即重新生成节点并回到入队路径。
+5. 若任务阻塞，则记录睡眠起点；若任务仍 runnable，则衰减交互分数并立即重新生成节点回到入队路径。
 
 结果：任务历史公平性被保留，系统时钟在任务离开后自动校正。
+
+### 3.5 静默回收：`eevdf_quiescent`
+
+触发时机：任务变成 not runnable，但可能还没真正进入 `running()`。
+
+执行步骤：
+
+1. 检查任务是否仍处于 `DISPATCHED` 中间态。
+2. 若是，则将其从“尚未兑现的 ready 统计”中移除，并重算 $V$。
+3. 清空任务绑定的运行态快照，回到 `IDLE`。
+
+结果：已派发但未实际运行就被取消的任务不会长期污染全局负载与虚拟时间统计。
 
 ## 4. 关键公式与判定条件
 
@@ -120,7 +158,13 @@ $$
 vslice = (slice\_ns \times NICE\_0\_LOAD \times wmult) \gg 32
 $$
 
-当前 `slice_ns` 固定为 3ms，公平性主要通过 `wmult` 体现。
+其中 `slice_ns` 由以下策略动态确定：
+
+$$
+slice = base\_slice \times load\_factor \times interactive\_factor \times affinity\_factor
+$$
+
+并限制在 $[1ms, 6ms]$ 范围内。
 
 ### 4.3 虚拟截止时间
 
@@ -144,24 +188,38 @@ $$
 
 该公式保证睡眠补偿语义与内核实现一致。
 
+### 4.5 亲和性感知调度分数
+
+$$
+score = vd + affinity\_penalty - wait\_bonus
+$$
+
+其中 `affinity_penalty` 反映跨核迁移代价，`wait_bonus` 用于抑制长期等待任务被亲和性策略饿死。
+
 ## 5. 并发与复杂度控制
 
 - 全局关键区由 `bpf_spin_lock` 保护。
 - rbtree 操作复杂度为 $O(logN)$。
-- `future -> ready` 搬运与 dispatch peek 均设置循环上限，防止单次 BPF 执行过长。
+- `future -> ready` 搬运和 Top-K 候选提取均设置循环上限，防止单次 BPF 执行过长。
 - 抢占 kick 受最小间隔限制，避免高频唤醒风暴。
 
-## 6. 实现中的不变量
+## 6. 参数化与观测
+
+- 关键调度参数通过 `const volatile` tunable 暴露给用户态，包括 `Top-K` 大小、亲和性惩罚、唤醒抢占粒度、交互睡眠阈值和负载/交互/亲和性比例。
+- loader 支持通过环境变量覆盖这些默认值，例如 `GEEVDF_TOPK`、`GEEVDF_AFFINITY_PENALTY_NS`、`GEEVDF_LOAD_BUSY_PCT`。
+- `eevdf_stats_map` 以 per-cpu 形式记录基础统计，包括本地/远程派发次数、抢占 kick 次数、候选跳过次数和 penalty 命中次数。
+
+## 7. 实现中的不变量
 
 - 不变量 1：`ready` 中任一节点都满足 $ve \le V$。
 - 不变量 2：`future` 的树顶是最早可能转入 `ready` 的候选。
-- 不变量 3：进入 CPU 运行的任务必须先从 ready 统计移到 running 统计。
+- 不变量 3：进入 CPU 运行的任务必须在 `running()` 中从 ready 统计移到 running 统计。
 - 不变量 4：每次 `stopping` 都会更新 `vlag`，确保后续唤醒公平恢复。
 
-## 7. 与默认调度路径的分工
+## 8. 与默认调度路径的分工
 
 - `select_cpu` 使用 `scx_bpf_select_cpu_dfl`，负责基础 CPU 选择。
-- `dispatch` 负责 EEVDF 的核心优先级决策。
+- `dispatch` 在全局 EEVDF 的基础上执行有限候选的亲和性感知重排。
 - `kick` 机制补足“已有运行任务但新任务更紧急”的抢占触发。
 
 这种分工让代码保持清晰：CPU 放置策略与全局 EEVDF 决策解耦。
