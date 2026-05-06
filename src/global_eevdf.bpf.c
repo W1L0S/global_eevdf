@@ -16,6 +16,7 @@
 #define MAX_DISPATCH_LOOPS 4
 #define MAX_PEEK_LOOPS     8
 #define MAX_DISPATCH_CANDIDATES 4
+#define MAX_STALE_REAP_LOOPS    8
 
 #define WAKEUP_PREEMPT_GRAN_NS       200000ULL
 #define WAKEUP_KICK_MIN_INTERVAL_NS  200000ULL
@@ -77,6 +78,7 @@ struct eevdf_stats {
     u64 dispatch_attempts;
     u64 dispatch_empty;
     u64 dispatch_aborts;
+    u64 dispatch_retries;
     u64 local_dispatches;
     u64 remote_dispatches;
     u64 running_transitions;
@@ -84,6 +86,8 @@ struct eevdf_stats {
     u64 wakeup_idle_kicks;
     u64 wakeup_preempt_kicks;
     u64 task_lookup_misses;
+    u64 ready_stale_reaps;
+    u64 future_stale_reaps;
     u64 affinity_penalty_hits;
     u64 recent_migration_penalty_hits;
     u64 wait_bonus_hits;
@@ -217,6 +221,7 @@ static __always_inline u64 eevdf_cfg_u64(u64 value, u64 fallback);
 static __always_inline u32 eevdf_dispatch_candidate_limit(void);
 static __always_inline u32 eevdf_effective_preferred_cpu_task(struct task_ctx *tctx, u64 now_ns);
 static __always_inline u32 eevdf_effective_preferred_cpu_node(struct eevdf_node *n, u64 now_ns);
+static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx);
 
 /* Clamp lag to ±3 * base_slice */
 static __always_inline s64 eevdf_clamp_lag(s64 lag)
@@ -281,7 +286,10 @@ static __always_inline void eevdf_kick_preempt_if_needed(struct task_struct *p,
     u64 curr_vd = acct->curr_vd;
     if (!curr_vd) return;
 
-    if (new_vd + eevdf_cfg_u64(cfg_wakeup_preempt_gran_ns, WAKEUP_PREEMPT_GRAN_NS) >= curr_vd)
+    u64 wakeup_gran = eevdf_cfg_u64(cfg_wakeup_preempt_gran_ns, WAKEUP_PREEMPT_GRAN_NS);
+    u64 vd_threshold = new_vd > (~0ULL - wakeup_gran) ? ~0ULL : new_vd + wakeup_gran;
+
+    if (vd_threshold >= curr_vd)
         return;
 
     if (last_kick)
@@ -296,17 +304,22 @@ static bool less_ready(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 {
     struct eevdf_node *na = container_of(a, struct eevdf_node, node);
     struct eevdf_node *nb = container_of(b, struct eevdf_node, node);
-    if (na->vd == nb->vd) return na->pid < nb->pid;
-    return na->vd < nb->vd;
+    if (na->vd != nb->vd)
+        return na->vd < nb->vd;
+    if (na->pid != nb->pid)
+        return na->pid < nb->pid;
+    return na->seq < nb->seq;
 }
 
 static bool less_future(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 {
     struct eevdf_node *na = container_of(a, struct eevdf_node, node);
     struct eevdf_node *nb = container_of(b, struct eevdf_node, node);
-    // 修复：当ve相等时使用pid作为tiebreaker，避免红黑树插入时的不确定性
-    if (na->ve == nb->ve) return na->pid < nb->pid;
-    return na->ve < nb->ve;
+    if (na->ve != nb->ve)
+        return na->ve < nb->ve;
+    if (na->pid != nb->pid)
+        return na->pid < nb->pid;
+    return na->seq < nb->seq;
 }
 
 static __always_inline u64 eevdf_scaled_weight(u64 weight)
@@ -387,6 +400,11 @@ static __always_inline u32 eevdf_cfg_u32(u32 value, u32 fallback)
 static __always_inline u64 eevdf_cfg_u64(u64 value, u64 fallback)
 {
     return value ? value : fallback;
+}
+
+static __always_inline u64 eevdf_sub_u64_floor(u64 value, u64 delta)
+{
+    return value >= delta ? value - delta : 0;
 }
 
 static __always_inline u32 eevdf_dispatch_candidate_limit(void)
@@ -563,65 +581,6 @@ static __always_inline u64 eevdf_calculate_slice(struct task_struct *p,
     return slice;
 }
 
-static __always_inline u64 eevdf_candidate_score(struct eevdf_node *n,
-                                                 struct task_struct *p,
-                                                 s32 cpu, u64 now_ns)
-{
-    u64 score;
-    u64 wait_bonus = 0;
-    u32 preferred_cpu;
-    u64 affinity_penalty;
-    u64 recent_migration_penalty;
-    u64 wait_bonus_cap;
-    u64 interactive_gran;
-    u64 short_sleep_ns;
-
-    if (!n || !p)
-        return ~0ULL;
-
-    if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-        return ~0ULL;
-
-    affinity_penalty = eevdf_cfg_u64(cfg_affinity_penalty_ns, AFFINITY_PENALTY_NS);
-    recent_migration_penalty = eevdf_cfg_u64(cfg_recent_migration_penalty_ns,
-                                             RECENT_MIGRATION_PENALTY_NS);
-    wait_bonus_cap = eevdf_cfg_u64(cfg_wait_bonus_cap_ns, WAIT_BONUS_CAP_NS);
-    interactive_gran = eevdf_cfg_u64(cfg_wakeup_preempt_gran_ns,
-                                     WAKEUP_PREEMPT_GRAN_NS);
-    short_sleep_ns = eevdf_cfg_u64(cfg_interactive_short_sleep_ns,
-                                   INTERACTIVE_SHORT_SLEEP_NS);
-
-    score = n->vd;
-
-    preferred_cpu = eevdf_effective_preferred_cpu_node(n, now_ns);
-    if (preferred_cpu < MAX_CPUS && preferred_cpu != (u32)cpu)
-        score += affinity_penalty;
-
-    if (n->last_cpu < MAX_CPUS && n->last_cpu != (u32)cpu)
-        score += affinity_penalty;
-
-    if (n->last_cpu < MAX_CPUS && n->last_cpu != (u32)cpu &&
-        n->last_cpu_ts &&
-        now_ns > n->last_cpu_ts &&
-        now_ns - n->last_cpu_ts < short_sleep_ns)
-        score += recent_migration_penalty;
-
-    if (n->enqueue_ns && now_ns > n->enqueue_ns) {
-        wait_bonus = (now_ns - n->enqueue_ns) >> 2;
-        if (wait_bonus > wait_bonus_cap)
-            wait_bonus = wait_bonus_cap;
-        if (score > wait_bonus)
-            score -= wait_bonus;
-        else
-            score = 0;
-    }
-
-    if (n->interactive_score >= 6 && score > interactive_gran)
-        score -= interactive_gran;
-
-    return score;
-}
-
 static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
 {
     s64 sum = sctx->avg_vruntime_sum + sctx->run_avg_vruntime_sum;
@@ -633,7 +592,10 @@ static __always_inline u64 eevdf_calc_V(struct eevdf_ctx_t *sctx)
     if (sum >= 0)
         V_now = sctx->base_v + ((u64)sum / load);
     else
-        V_now = sctx->base_v - ((u64)(-sum + load - 1) / load);
+    {
+        u64 offset = ((u64)(-sum) + load - 1) / load;
+        V_now = offset >= sctx->base_v ? 0 : sctx->base_v - offset;
+    }
 
     s64 dv = (s64)(V_now - sctx->base_v);
     if (dv > (s64)(LAG_CLAMP_NS * 4ULL) || dv < -(s64)(LAG_CLAMP_NS * 4ULL)) {
@@ -683,25 +645,28 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     struct eevdf_node *n;
     struct eevdf_ctx_t *sctx;
     struct task_ctx *tctx;
-    struct bpf_rb_node *fnode;
-    struct eevdf_node *fn;
     u32 key = 0;
     u64 v, weight, wmult, slice_ns, vslice;
-    s64 lag;
     u64 now_ns;
     u32 preferred_cpu;
     int idx;
 
-    // 分配新的EEVDF节点
-    n = bpf_obj_new(typeof(*n));
-    if (!n) return 0;
-
     sctx = bpf_map_lookup_elem(&eevdf_ctx, &key);
-    if (!sctx) { bpf_obj_drop(n); return 0; }
+    if (!sctx)
+        return 0;
 
     tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-    if (!tctx) { bpf_obj_drop(n); return 0; }
+    if (!tctx)
+        return 0;
     eevdf_task_ctx_init(tctx);
+    if (tctx->run_state != EEVDF_TASK_IDLE ||
+        tctx->queued_tree != EEVDF_QUEUE_NONE)
+        return 0;
+
+    // 分配新的EEVDF节点
+    n = bpf_obj_new(typeof(*n));
+    if (!n)
+        return 0;
 
     n->pid = p->pid;
 
@@ -775,7 +740,7 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
              */
 
             // 获取保存的vlag
-            s64 vlag = tctx->vlag;
+            s64 vlag = eevdf_clamp_lag(tctx->vlag);
 
             // 应用lag衰减/限制（参考Linux内核）
             // 限制最大补偿和惩罚范围
@@ -814,29 +779,8 @@ int BPF_PROG(eevdf_enqueue, struct task_struct *p, u64 enq_flags)
     u64 new_ve = n->ve;
     u64 new_vd = n->vd;
 
-    // 保存当前的V，用于判断任务应该进入哪个队列
-    u64 V_old = sctx->V;
-
     // 将任务加入负载统计
     eevdf_avg_add(sctx, n);
-
-    // 将future队列中已eligible的任务转移到ready队列
-    // 严格判断：ve <= V_old
-    int move_loops = 0;
-    while (move_loops < MAX_DISPATCH_LOOPS) {
-        fnode = bpf_rbtree_first(&sctx->future);
-        if (!fnode) break;
-        fn = container_of(fnode, struct eevdf_node, node);
-        if (fn->ve > V_old) break;  // 不eligible
-
-        fnode = bpf_rbtree_remove(&sctx->future, fnode);
-        if (!fnode) break;
-        bpf_rbtree_add(&sctx->ready, fnode, less_ready);
-        if (sctx->nr_future)
-            sctx->nr_future--;
-        sctx->nr_ready++;
-        move_loops++;
-    }
 
     // 重新计算 V（基于所有任务的 vruntime 加权平均值）
     // 这是 V 自然增长的核心机制
@@ -872,6 +816,7 @@ SEC("struct_ops/dispatch")
 int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
 {
     struct bpf_rb_node *node;
+    struct bpf_rb_node *reinsert_node;
     struct eevdf_node *n;
     struct task_struct *p;
     struct eevdf_ctx_t *sctx;
@@ -879,11 +824,16 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     struct eevdf_stats *stats;
     u32 key = 0;
     bool run_local = true;
+    bool stale_node = false;
     s32 target_cpu = cpu;
     bool abort_dispatch = false;
-    u64 w_val, ve, vd, slice, V_now;
+    u64 w_val, ve, vd, slice, V_now, now_ns;
+    u32 dispatch_retries = 0;
+    int stale_loops;
 
     if (cpu < 0 || cpu >= MAX_CPUS) return 0;
+
+    now_ns = bpf_ktime_get_ns();
 
     sctx = bpf_map_lookup_elem(&eevdf_ctx, &key);
     if (!sctx) return 0;
@@ -891,13 +841,102 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     if (stats)
         stats->dispatch_attempts++;
 
+retry_dispatch:
     bpf_spin_lock(&sctx->lock);
+
+    stale_loops = 0;
+    while (stale_loops < MAX_STALE_REAP_LOOPS) {
+        node = bpf_rbtree_first(&sctx->ready);
+        if (!node)
+            break;
+
+        reinsert_node = bpf_rbtree_remove(&sctx->ready, node);
+        if (!reinsert_node)
+            break;
+
+        n = container_of(reinsert_node, struct eevdf_node, node);
+        bpf_spin_unlock(&sctx->lock);
+
+        stale_node = true;
+        p = bpf_task_from_pid(n->pid);
+        if (p) {
+            tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+            if (tctx && tctx->active_node_seq == n->seq)
+                stale_node = false;
+            bpf_task_release(p);
+        }
+
+        bpf_spin_lock(&sctx->lock);
+        if (!stale_node) {
+            bpf_rbtree_add(&sctx->ready, reinsert_node, less_ready);
+            break;
+        }
+
+        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) *
+                                  (s64)eevdf_scaled_weight(n->weight);
+        sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load,
+                                             eevdf_scaled_weight(n->weight));
+        if (sctx->nr_ready)
+            sctx->nr_ready--;
+        sctx->V = eevdf_calc_V(sctx);
+        if (stats)
+            __sync_fetch_and_add(&stats->ready_stale_reaps, 1);
+        bpf_spin_unlock(&sctx->lock);
+        bpf_obj_drop(n);
+        stale_loops++;
+        bpf_spin_lock(&sctx->lock);
+    }
+
+    stale_loops = 0;
+    while (stale_loops < MAX_STALE_REAP_LOOPS) {
+        node = bpf_rbtree_first(&sctx->future);
+        if (!node)
+            break;
+
+        reinsert_node = bpf_rbtree_remove(&sctx->future, node);
+        if (!reinsert_node)
+            break;
+
+        n = container_of(reinsert_node, struct eevdf_node, node);
+        bpf_spin_unlock(&sctx->lock);
+
+        stale_node = true;
+        p = bpf_task_from_pid(n->pid);
+        if (p) {
+            tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+            if (tctx && tctx->active_node_seq == n->seq)
+                stale_node = false;
+            bpf_task_release(p);
+        }
+
+        bpf_spin_lock(&sctx->lock);
+        if (!stale_node) {
+            bpf_rbtree_add(&sctx->future, reinsert_node, less_future);
+            break;
+        }
+
+        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) *
+                                  (s64)eevdf_scaled_weight(n->weight);
+        sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load,
+                                             eevdf_scaled_weight(n->weight));
+        if (sctx->nr_future)
+            sctx->nr_future--;
+        sctx->V = eevdf_calc_V(sctx);
+        if (stats)
+            __sync_fetch_and_add(&stats->future_stale_reaps, 1);
+        bpf_spin_unlock(&sctx->lock);
+        bpf_obj_drop(n);
+        stale_loops++;
+        bpf_spin_lock(&sctx->lock);
+    }
 
     node = bpf_rbtree_first(&sctx->ready);
     bool ready_empty = !node;
 
     // 检查 future 队列
-    struct bpf_rb_node *future_node = bpf_rbtree_first(&sctx->future);
+    struct bpf_rb_node *future_node = NULL;
+    if (sctx->nr_future)
+        future_node = bpf_rbtree_first(&sctx->future);
     if (future_node) {
         struct eevdf_node *future_task = container_of(future_node, struct eevdf_node, node);
 
@@ -913,6 +952,8 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
     // Future -> Ready 转移（严格 Eligible 判断）
     int loops = 0;
     while (loops < MAX_DISPATCH_LOOPS) {
+        if (!sctx->nr_future)
+            break;
         node = bpf_rbtree_first(&sctx->future);
         if (!node) break;
         n = container_of(node, struct eevdf_node, node);
@@ -927,106 +968,192 @@ int BPF_PROG(eevdf_dispatch, s32 cpu, struct task_struct *prev)
         sctx->nr_ready++;
         loops++;
     }
-    node = bpf_rbtree_first(&sctx->ready);
-    if (!node) {
+
+    u64 wait_bonus_cap = eevdf_cfg_u64(cfg_wait_bonus_cap_ns, WAIT_BONUS_CAP_NS);
+    u64 affinity_penalty = eevdf_cfg_u64(cfg_affinity_penalty_ns, AFFINITY_PENALTY_NS);
+    u64 recent_migration_penalty = eevdf_cfg_u64(cfg_recent_migration_penalty_ns, RECENT_MIGRATION_PENALTY_NS);
+    u64 interactive_gran = eevdf_cfg_u64(cfg_wakeup_preempt_gran_ns, WAKEUP_PREEMPT_GRAN_NS);
+    u64 short_sleep_ns = eevdf_cfg_u64(cfg_interactive_short_sleep_ns, INTERACTIVE_SHORT_SLEEP_NS);
+    u64 max_deduction = wait_bonus_cap + interactive_gran;
+    u32 k_max = eevdf_dispatch_candidate_limit();
+
+    struct bpf_rb_node *cand0 = NULL;
+    struct bpf_rb_node *cand1 = NULL;
+    struct bpf_rb_node *cand2 = NULL;
+    struct bpf_rb_node *cand3 = NULL;
+
+    u64 score0 = ~0ULL, score1 = ~0ULL, score2 = ~0ULL, score3 = ~0ULL;
+    u64 min_score = ~0ULL;
+    u8 best_idx = 0;
+
+#define EVAL_CANDIDATE(CAND_VAR, SCORE_VAR, CAND_IDX) do { \
+    node = bpf_rbtree_first(&sctx->ready); \
+    if (node) { \
+        n = container_of(node, struct eevdf_node, node); \
+        if (min_score == ~0ULL || n->vd < min_score + max_deduction) { \
+            CAND_VAR = bpf_rbtree_remove(&sctx->ready, node); \
+            if (CAND_VAR) { \
+                n = container_of(CAND_VAR, struct eevdf_node, node); \
+                u64 wait_time = (now_ns > n->enqueue_ns) ? (now_ns - n->enqueue_ns) : 0; \
+                u64 bonus = (wait_time > wait_bonus_cap) ? wait_bonus_cap : wait_time; \
+                u64 score = n->vd; \
+                u32 pref_cpu = eevdf_effective_preferred_cpu_node(n, now_ns); \
+                if (pref_cpu != (u32)cpu && n->last_cpu != (u32)cpu) { \
+                    score += affinity_penalty; \
+                    if (stats) __sync_fetch_and_add(&stats->affinity_penalty_hits, 1); \
+                } \
+                if (n->last_cpu < MAX_CPUS && n->last_cpu != (u32)cpu && \
+                    n->last_cpu_ts && now_ns > n->last_cpu_ts && \
+                    now_ns - n->last_cpu_ts < short_sleep_ns) { \
+                    score += recent_migration_penalty; \
+                    if (stats) __sync_fetch_and_add(&stats->recent_migration_penalty_hits, 1); \
+                } \
+                if (score > bonus) score -= bonus; else score = 0; \
+                if (bonus > 0 && stats) __sync_fetch_and_add(&stats->wait_bonus_hits, 1); \
+                if (n->interactive_score >= 6) { \
+                    if (score > interactive_gran) score -= interactive_gran; else score = 0; \
+                    if (stats) __sync_fetch_and_add(&stats->interactive_boost_hits, 1); \
+                } \
+                SCORE_VAR = score; \
+                if (score < min_score) { \
+                    min_score = score; \
+                    best_idx = CAND_IDX; \
+                } \
+            } \
+        } \
+    } \
+} while(0)
+
+    if (k_max > 0) EVAL_CANDIDATE(cand0, score0, 0);
+    if (k_max > 1 && cand0) EVAL_CANDIDATE(cand1, score1, 1);
+    if (k_max > 2 && cand1) EVAL_CANDIDATE(cand2, score2, 2);
+    if (k_max > 3 && cand2) EVAL_CANDIDATE(cand3, score3, 3);
+
+#undef EVAL_CANDIDATE
+
+    if (!cand0 && !cand1 && !cand2 && !cand3) {
         bpf_spin_unlock(&sctx->lock);
         if (stats)
             stats->dispatch_empty++;
         return 0;
     }
 
-    node = bpf_rbtree_remove(&sctx->ready, node);
-    if (!node) {
-        bpf_spin_unlock(&sctx->lock);
-        if (stats)
-            stats->dispatch_empty++;
-        return 0;
+#define FINALIZE_DISPATCH(O_BEST) do { \
+    n = container_of(O_BEST, struct eevdf_node, node); \
+    bpf_spin_unlock(&sctx->lock); \
+    p = bpf_task_from_pid(n->pid); \
+    if (!p) { \
+        if (stats) \
+            __sync_fetch_and_add(&stats->task_lookup_misses, 1); \
+        bpf_spin_lock(&sctx->lock); \
+        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) * \
+                                  (s64)eevdf_scaled_weight(n->weight); \
+        sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load, \
+                                             eevdf_scaled_weight(n->weight)); \
+        if (sctx->nr_ready) \
+            sctx->nr_ready--; \
+        sctx->V = eevdf_calc_V(sctx); \
+        bpf_spin_unlock(&sctx->lock); \
+        bpf_obj_drop(n); \
+        if (dispatch_retries < MAX_DISPATCH_LOOPS) { \
+            dispatch_retries++; \
+            if (stats) \
+                __sync_fetch_and_add(&stats->dispatch_retries, 1); \
+            goto retry_dispatch; \
+        } \
+        return 0; \
+    } \
+    tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0); \
+    if (!tctx || tctx->active_node_seq != n->seq) { \
+        bpf_spin_lock(&sctx->lock); \
+        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) * \
+                                  (s64)eevdf_scaled_weight(n->weight); \
+        sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load, \
+                                             eevdf_scaled_weight(n->weight)); \
+        if (sctx->nr_ready) \
+            sctx->nr_ready--; \
+        sctx->V = eevdf_calc_V(sctx); \
+        bpf_spin_unlock(&sctx->lock); \
+        bpf_task_release(p); \
+        bpf_obj_drop(n); \
+        if (dispatch_retries < MAX_DISPATCH_LOOPS) { \
+            dispatch_retries++; \
+            if (stats) \
+                __sync_fetch_and_add(&stats->dispatch_retries, 1); \
+            goto retry_dispatch; \
+        } \
+        return 0; \
+    } \
+    target_cpu = scx_bpf_task_cpu(p); \
+    if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) { \
+        run_local = true; \
+    } else if (target_cpu >= 0 && target_cpu < MAX_CPUS && \
+               bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) { \
+        run_local = false; \
+    } else { \
+        abort_dispatch = true; \
+    } \
+    bpf_spin_lock(&sctx->lock); \
+    if (abort_dispatch) { \
+        bpf_rbtree_add(&sctx->ready, &n->node, less_ready); \
+        if (stats) \
+            __sync_fetch_and_add(&stats->dispatch_aborts, 1); \
+        sctx->V = eevdf_calc_V(sctx); \
+        bpf_spin_unlock(&sctx->lock); \
+        bpf_task_release(p); \
+        return 0; \
+    } \
+    w_val = eevdf_scaled_weight(n->weight); \
+    ve = n->ve; \
+    vd = n->vd; \
+    slice = n->slice_ns; \
+    sctx->V = eevdf_calc_V(sctx); \
+    V_now = sctx->V; \
+    bpf_spin_unlock(&sctx->lock); \
+    eevdf_task_ctx_init(tctx); \
+    eevdf_clear_queued_snapshot(tctx); \
+    tctx->run_state = EEVDF_TASK_DISPATCHED; \
+    tctx->last_run_ns = 0; \
+    tctx->saved_vd = vd; \
+    tctx->run_weight_val = w_val; \
+    tctx->run_wmult = n->wmult; \
+    if (!run_local) { \
+        u64 dsq_id = SCX_DSQ_LOCAL_ON | target_cpu; \
+        if (stats) \
+            __sync_fetch_and_add(&stats->remote_dispatches, 1); \
+        scx_bpf_dispatch(p, dsq_id, slice, 0); \
+        eevdf_kick_preempt_if_needed(p, ve, vd, V_now); \
+    } else { \
+        if (stats) \
+            __sync_fetch_and_add(&stats->local_dispatches, 1); \
+        scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, 0); \
+    } \
+    bpf_task_release(p); \
+    bpf_obj_drop(n); \
+    return 0; \
+} while(0)
+
+    if (best_idx == 0) {
+        if (cand1) bpf_rbtree_add(&sctx->ready, cand1, less_ready);
+        if (cand2) bpf_rbtree_add(&sctx->ready, cand2, less_ready);
+        if (cand3) bpf_rbtree_add(&sctx->ready, cand3, less_ready);
+        FINALIZE_DISPATCH(cand0);
+    } else if (best_idx == 1) {
+        if (cand0) bpf_rbtree_add(&sctx->ready, cand0, less_ready);
+        if (cand2) bpf_rbtree_add(&sctx->ready, cand2, less_ready);
+        if (cand3) bpf_rbtree_add(&sctx->ready, cand3, less_ready);
+        FINALIZE_DISPATCH(cand1);
+    } else if (best_idx == 2) {
+        if (cand0) bpf_rbtree_add(&sctx->ready, cand0, less_ready);
+        if (cand1) bpf_rbtree_add(&sctx->ready, cand1, less_ready);
+        if (cand3) bpf_rbtree_add(&sctx->ready, cand3, less_ready);
+        FINALIZE_DISPATCH(cand2);
+    } else if (best_idx == 3) {
+        if (cand0) bpf_rbtree_add(&sctx->ready, cand0, less_ready);
+        if (cand1) bpf_rbtree_add(&sctx->ready, cand1, less_ready);
+        if (cand2) bpf_rbtree_add(&sctx->ready, cand2, less_ready);
+        FINALIZE_DISPATCH(cand3);
     }
-    n = container_of(node, struct eevdf_node, node);
-    bpf_spin_unlock(&sctx->lock);
-
-    p = bpf_task_from_pid(n->pid);
-    if (!p) {
-        if (stats)
-            stats->task_lookup_misses++;
-        bpf_spin_lock(&sctx->lock);
-        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) *
-                                  (s64)eevdf_scaled_weight(n->weight);
-        sctx->avg_load -= eevdf_scaled_weight(n->weight);
-        if (sctx->nr_ready)
-            sctx->nr_ready--;
-        sctx->V = eevdf_calc_V(sctx);
-        bpf_spin_unlock(&sctx->lock);
-        bpf_obj_drop(n);
-        return 0;
-    }
-
-    tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-    if (!tctx || tctx->active_node_seq != n->seq) {
-        bpf_spin_lock(&sctx->lock);
-        sctx->avg_vruntime_sum -= (s64)(n->ve - sctx->base_v) *
-                                  (s64)eevdf_scaled_weight(n->weight);
-        sctx->avg_load -= eevdf_scaled_weight(n->weight);
-        if (sctx->nr_ready)
-            sctx->nr_ready--;
-        sctx->V = eevdf_calc_V(sctx);
-        bpf_spin_unlock(&sctx->lock);
-        bpf_task_release(p);
-        bpf_obj_drop(n);
-        return 0;
-    }
-
-    target_cpu = scx_bpf_task_cpu(p);
-    if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-        run_local = true;
-    } else if (target_cpu >= 0 && target_cpu < MAX_CPUS &&
-               bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
-        run_local = false;
-    } else {
-        abort_dispatch = true;
-    }
-
-    bpf_spin_lock(&sctx->lock);
-    if (abort_dispatch) {
-        bpf_rbtree_add(&sctx->ready, &n->node, less_ready);
-        if (stats)
-            stats->dispatch_aborts++;
-        sctx->V = eevdf_calc_V(sctx);
-        bpf_spin_unlock(&sctx->lock);
-        bpf_task_release(p);
-        return 0;
-    }
-
-    w_val = eevdf_scaled_weight(n->weight);
-    ve = n->ve;
-    vd = n->vd;
-    slice = n->slice_ns;
-    sctx->V = eevdf_calc_V(sctx);
-    V_now = sctx->V;
-    bpf_spin_unlock(&sctx->lock);
-
-    eevdf_task_ctx_init(tctx);
-    eevdf_clear_queued_snapshot(tctx);
-    tctx->run_state = EEVDF_TASK_DISPATCHED;
-    tctx->last_run_ns = 0;
-    tctx->saved_vd = vd;
-    tctx->run_weight_val = w_val;
-    tctx->run_wmult = n->wmult;
-
-    if (!run_local) {
-        u64 dsq_id = SCX_DSQ_LOCAL_ON | target_cpu;
-        if (stats)
-            stats->remote_dispatches++;
-        scx_bpf_dispatch(p, dsq_id, slice, 0);
-        eevdf_kick_preempt_if_needed(p, ve, vd, V_now);
-    } else {
-        if (stats)
-            stats->local_dispatches++;
-        scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice, 0);
-    }
-
-    bpf_task_release(p);
-    bpf_obj_drop(n);
 
     return 0;
 }
@@ -1068,7 +1195,7 @@ void BPF_PROG(eevdf_running, struct task_struct *p)
         s64 key_val = (s64)(tctx->vruntime - sctx->base_v) * (s64)w_val;
 
         sctx->avg_vruntime_sum -= key_val;
-        sctx->avg_load -= w_val;
+        sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load, w_val);
         sctx->run_avg_vruntime_sum += key_val;
         sctx->run_avg_load += w_val;
         if (sctx->nr_ready)
@@ -1121,6 +1248,12 @@ void BPF_PROG(eevdf_dequeue, struct task_struct *p, u64 deq_flags)
         tctx->queued_tree == EEVDF_QUEUE_NONE)
         return;
 
+    /*
+     * We can't safely remove the queued node here because rbtree_remove()
+     * requires a verifier-tracked non-owning ref. Instead we invalidate the
+     * task-side snapshot and let dispatch() reap the stale node once it reaches
+     * the tree head, keeping accounting consistent.
+     */
     eevdf_clear_queued_snapshot(tctx);
 }
 
@@ -1153,7 +1286,8 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
     u64 w = tctx->run_weight_val;
     u64 wmult = tctx->run_wmult;
     u64 now = bpf_ktime_get_ns();
-    u64 delta_ns = tctx->last_run_ns ? now - tctx->last_run_ns : 0;
+    u64 delta_ns = (tctx->last_run_ns && now > tctx->last_run_ns) ?
+                   now - tctx->last_run_ns : 0;
     u64 delta_v = (delta_ns * NICE_0_LOAD * wmult) >> 32;
     u64 new_vruntime = old_vruntime + delta_v;
 
@@ -1178,7 +1312,10 @@ int BPF_PROG(eevdf_stopping, struct task_struct *p, bool runnable)
      *   vruntime = V_new - vlag
      */
     tctx->vruntime = new_vruntime;
-    tctx->vlag = (s64)(sctx->V - tctx->vruntime);
+    if (sctx->V >= tctx->vruntime)
+        tctx->vlag = eevdf_clamp_lag((s64)(sctx->V - tctx->vruntime));
+    else
+        tctx->vlag = eevdf_clamp_lag(-((s64)(tctx->vruntime - sctx->V)));
 
     bpf_spin_unlock(&sctx->lock);
 
@@ -1296,10 +1433,7 @@ void BPF_PROG(eevdf_quiescent, struct task_struct *p, u64 deq_flags)
 
     bpf_spin_lock(&sctx->lock);
     sctx->avg_vruntime_sum -= (s64)(tctx->vruntime - sctx->base_v) * (s64)w;
-    if (sctx->avg_load >= w)
-        sctx->avg_load -= w;
-    else
-        sctx->avg_load = 0;
+    sctx->avg_load = eevdf_sub_u64_floor(sctx->avg_load, w);
     if (sctx->nr_ready)
         sctx->nr_ready--;
     sctx->V = eevdf_calc_V(sctx);

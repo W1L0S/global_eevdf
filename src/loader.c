@@ -17,6 +17,7 @@ struct eevdf_stats {
     u64 dispatch_attempts;
     u64 dispatch_empty;
     u64 dispatch_aborts;
+    u64 dispatch_retries;
     u64 local_dispatches;
     u64 remote_dispatches;
     u64 running_transitions;
@@ -24,6 +25,8 @@ struct eevdf_stats {
     u64 wakeup_idle_kicks;
     u64 wakeup_preempt_kicks;
     u64 task_lookup_misses;
+    u64 ready_stale_reaps;
+    u64 future_stale_reaps;
     u64 affinity_penalty_hits;
     u64 recent_migration_penalty_hits;
     u64 wait_bonus_hits;
@@ -162,6 +165,7 @@ static void aggregate_stats(struct eevdf_stats *dst, const struct eevdf_stats *s
     dst->dispatch_attempts += src->dispatch_attempts;
     dst->dispatch_empty += src->dispatch_empty;
     dst->dispatch_aborts += src->dispatch_aborts;
+    dst->dispatch_retries += src->dispatch_retries;
     dst->local_dispatches += src->local_dispatches;
     dst->remote_dispatches += src->remote_dispatches;
     dst->running_transitions += src->running_transitions;
@@ -169,6 +173,8 @@ static void aggregate_stats(struct eevdf_stats *dst, const struct eevdf_stats *s
     dst->wakeup_idle_kicks += src->wakeup_idle_kicks;
     dst->wakeup_preempt_kicks += src->wakeup_preempt_kicks;
     dst->task_lookup_misses += src->task_lookup_misses;
+    dst->ready_stale_reaps += src->ready_stale_reaps;
+    dst->future_stale_reaps += src->future_stale_reaps;
     dst->affinity_penalty_hits += src->affinity_penalty_hits;
     dst->recent_migration_penalty_hits += src->recent_migration_penalty_hits;
     dst->wait_bonus_hits += src->wait_bonus_hits;
@@ -211,6 +217,7 @@ static void print_stats(SKEL_TYPE *skel)
     printf("  dispatch_attempts      : %llu\n", (unsigned long long)total.dispatch_attempts);
     printf("  dispatch_empty         : %llu\n", (unsigned long long)total.dispatch_empty);
     printf("  dispatch_aborts        : %llu\n", (unsigned long long)total.dispatch_aborts);
+    printf("  dispatch_retries       : %llu\n", (unsigned long long)total.dispatch_retries);
     printf("  local_dispatches       : %llu\n", (unsigned long long)total.local_dispatches);
     printf("  remote_dispatches      : %llu\n", (unsigned long long)total.remote_dispatches);
     printf("  running_transitions    : %llu\n", (unsigned long long)total.running_transitions);
@@ -218,6 +225,8 @@ static void print_stats(SKEL_TYPE *skel)
     printf("  wakeup_idle_kicks      : %llu\n", (unsigned long long)total.wakeup_idle_kicks);
     printf("  wakeup_preempt_kicks   : %llu\n", (unsigned long long)total.wakeup_preempt_kicks);
     printf("  task_lookup_misses     : %llu\n", (unsigned long long)total.task_lookup_misses);
+    printf("  ready_stale_reaps      : %llu\n", (unsigned long long)total.ready_stale_reaps);
+    printf("  future_stale_reaps     : %llu\n", (unsigned long long)total.future_stale_reaps);
     printf("  affinity_penalty_hits  : %llu\n", (unsigned long long)total.affinity_penalty_hits);
     printf("  recent_migration_hits  : %llu\n", (unsigned long long)total.recent_migration_penalty_hits);
     printf("  wait_bonus_hits        : %llu\n", (unsigned long long)total.wait_bonus_hits);
@@ -234,11 +243,14 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    /*
+     * On newer kernels / constrained containers, raising RLIMIT_MEMLOCK may be
+     * rejected even though BPF loading can still succeed. Warn and continue so
+     * runtime validation can proceed when the environment already permits it.
+     */
     err = bump_memlock_rlimit();
-    if (err) {
-        fprintf(stderr, "Failed to increase rlimit: %d\n", err);
-        return 1;
-    }
+    if (err)
+        fprintf(stderr, "Warning: failed to increase rlimit, continuing: %d\n", err);
 
     skel = SKEL_OPEN;
     if (!skel) {

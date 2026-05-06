@@ -104,6 +104,7 @@ done
 
 LOADER_BIN="./build/loader_global_eevdf"
 SCHED_NAME="global_eevdf"
+BPF_VERSION="global_eevdf"
 
 echo "========================================"
 echo "Global EEVDF 调度器测试"
